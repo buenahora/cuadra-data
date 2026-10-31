@@ -77,16 +77,24 @@ def test_market_stats_matches_prototype_within_tolerance(con):
     for key, expected in EXPECTED.items():
         assert key in by_key, f"falta {key} en market_stats"
         _, _, avisos, precio_min, precio_mediana, precio_max = by_key[key]
-        # market_stats filtra outliers de precio por zona+dormitorios (mediana
-        # +- 1.5*IQR, ver dbt/models/marts/market_listings.sql, agregado
-        # 2026-08-14). gen_prices() fuerza el min/max exacto dentro de la
-        # muestra sintética (ver su docstring) -- cuando el resto de la
-        # muestra (triangular alrededor de la mediana) queda apretada, esos
-        # dos extremos forzados pueden caer como outliers legítimos y
-        # filtrarse. Un puñado menos de avisos y un min/max más cerrado que
-        # el original es exactamente lo esperado, no una regresión -- por
-        # eso estas 3 aserciones toleran, no exigen exactitud.
-        assert avisos >= expected["avisos"] - 5, f"{key}: muy pocos avisos tras el filtro de outliers"
+        # Dos filtros del pipeline pueden restar avisos sobre la muestra
+        # sintética, los dos a propósito:
+        #   1. dedup de re-listados de listings_unified (agregado 2026-08-19):
+        #      misma zona+tipo+dormitorios+metraje+precio = un solo aviso.
+        #      Sobre datos sintéticos esa firma coincide por casualidad en
+        #      algún par de avisos (hoy: 1 en Cordón 1 dormitorio).
+        #   2. outliers de precio por zona+dormitorios (mediana +- 1.5*IQR,
+        #      ver dbt/models/marts/market_listings.sql). Hoy no saca nada:
+        #      gen_prices() reparte la muestra mitad abajo y mitad arriba de
+        #      la mediana, así el IQR es lo bastante ancho como para que el
+        #      min y el max forzados no caigan afuera (ver su docstring, que
+        #      explica el caso en que sí los sacaba).
+        # Por eso estas 3 aserciones toleran, no exigen exactitud: la muestra
+        # es aleatoria y los filtros son parte del pipeline, no del dato.
+        tolerancia = max(2, round(expected["avisos"] * 0.1))
+        assert avisos >= expected["avisos"] - tolerancia, (
+            f"{key}: muy pocos avisos tras el dedup y el filtro de outliers"
+        )
         assert abs(precio_min - expected["min"]) / expected["min"] < 0.15
         assert abs(precio_max - expected["max"]) / expected["max"] < 0.15
         # la mediana es sintética/aleatoria (ver etl/extract/), se tolera +-15%

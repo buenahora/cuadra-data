@@ -88,7 +88,13 @@ filtered as (
       -- siguen ingestados enteros en bronze/staging (stg_listings_casasweb,
       -- stg_listings_buscandocasa) -- sacar este filtro alcanza para
       -- volver a sumarlas acá el día que se resuelva esa UX.
-      and fuente_datos = 'infocasas'
+      --
+      -- 'synthetic' entra igual que 'infocasas': generate_synthetic_listings.py
+      -- produce raw.listings con la forma de InfoCasas (ver su docstring y
+      -- _sources.yml) y es la única fuente del entorno sintético. Sin esto,
+      -- pipelines/run_local.py deja el gold vacío y con él market_stats,
+      -- market_snapshots del mes actual y listing_market_position.
+      and fuente_datos in ('infocasas', 'synthetic')
 ),
 
 -- Dedup de re-listados (encontrado 2026-08-19, investigando outliers en

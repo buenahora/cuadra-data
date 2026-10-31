@@ -4,6 +4,7 @@ network access + robots.txt handling is exercised manually
 (`uv run python etl/extract/scrape_infocasas.py --max-pages N`), not in the
 test suite, per docs/scraping-strategy.md."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -66,20 +67,75 @@ def test_stable_orders_are_price_asc_and_m2_asc():
 
 def test_normalize_row_uyu_listing():
     fallback_rate = [40.0]
-    row = normalize_row(make_item(), fallback_rate)
+    item = make_item()
+    row = normalize_row(item, fallback_rate)
+    # Contrato completo de columnas de bronze (el mismo de write_csv y de
+    # generate_synthetic_listings.py): un aviso mínimo como make_item() deja
+    # vacías las que dependen de campos que el item no trae, pero las
+    # devuelve igual -- si falta una, raw.listings cambia de forma y los
+    # modelos de staging no bindean.
     assert row == {
         "listing_id": "IC194077005",
         "barrio": "Cordón",
+        "direccion": "",
+        "latitud": "",
+        "longitud": "",
         "dormitorios": 1,
+        "banos": "",
         "metraje_m2": 50,
         "precio": 26000,
         "estado": "activo",
         "publicado_en": "2026-08-05",
+        "descripcion": "",
+        "amenities": "",
         "fotos": "",
         "foto_count": "",
+        "datos_crudos": json.dumps(item, ensure_ascii=False),
     }
     # UYU listings update the running fallback rate from their own currency.rate
     assert fallback_rate == [40.0]
+
+
+def test_normalize_row_maps_bathrooms_to_banos():
+    row = normalize_row(make_item(bathrooms=2), [40.0])
+    assert row["banos"] == 2
+
+
+def test_normalize_row_takes_direccion_and_coords_from_the_same_json():
+    # Ver normalize_row(): location_point es un WKT "POINT (lon lat)" --
+    # ojo el orden lon/lat, no lat/lon.
+    row = normalize_row(
+        make_item(
+            address="Soriano 1234",
+            locations={
+                "neighbourhood": [{"name": "Cordón"}],
+                "location_point": "POINT (-56.1833 -34.9033)",
+            },
+        ),
+        [40.0],
+    )
+    assert row["direccion"] == "Soriano 1234"
+    assert row["longitud"] == "-56.1833"
+    assert row["latitud"] == "-34.9033"
+
+
+def test_normalize_row_flattens_facilities_into_pipe_separated_amenities():
+    row = normalize_row(
+        make_item(
+            description="Luminoso, al frente.",
+            facilities=[{"name": "Garaje"}, {"name": "Parrillero"}, {"sin_nombre": True}],
+        ),
+        [40.0],
+    )
+    assert row["descripcion"] == "Luminoso, al frente."
+    assert row["amenities"] == "Garaje|Parrillero"
+
+
+def test_normalize_row_datos_crudos_keeps_fields_without_column_of_their_own():
+    # El punto de datos_crudos: campos que el extractor no normaliza (acá
+    # commonExpenses) viajan igual, sin agregar una columna nueva.
+    row = normalize_row(make_item(commonExpenses=4500), [40.0])
+    assert json.loads(row["datos_crudos"])["commonExpenses"] == 4500
 
 
 def test_normalize_row_updates_fallback_rate_from_uyu_listing():

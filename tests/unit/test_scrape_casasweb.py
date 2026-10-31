@@ -4,6 +4,7 @@ hit the network -- network access + robots.txt handling is exercised
 manually (`uv run python etl/extract/scrape_casasweb.py --max-zonas N`),
 same convention as test_scrape_infocasas.py."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -34,18 +35,42 @@ def make_item(**overrides):
 
 
 def test_normalize_row_uyu_listing():
-    row = normalize_row(make_item(), fallback_uyu_per_usd=40.0)
+    item = make_item()
+    row = normalize_row(item, fallback_uyu_per_usd=40.0)
+    # Contrato de bronze de esta fuente: sin direccion/latitud/longitud/
+    # descripcion/amenities (Casasweb no las expone en ningún endpoint, ver
+    # docstring del extractor) -- esas columnas las pone el modelo de
+    # staging como NULL, no el extractor. banos y datos_crudos sí vienen acá.
     assert row == {
         "listing_id": "CW252165",
         "barrio": "Pocitos",
         "dormitorios": 1,
+        "banos": "",
         "metraje_m2": 50,
         "precio": 16500,
         "estado": "activo",
         "publicado_en": "2026-08-05T10:00:00",
         "fotos": "",
         "foto_count": "",
+        "datos_crudos": json.dumps(item, ensure_ascii=False),
     }
+
+
+def test_normalize_row_maps_banos():
+    row = normalize_row(make_item(banos=2), fallback_uyu_per_usd=40.0)
+    assert row["banos"] == 2
+
+
+def test_normalize_row_datos_crudos_keeps_fields_without_column_of_their_own():
+    # El punto de datos_crudos: campos que el extractor no normaliza (acá
+    # inmobiliaria y expensas) viajan igual, sin agregar una columna nueva.
+    row = normalize_row(
+        make_item(inmobiliaria="Ejemplo Propiedades", expensas=3200),
+        fallback_uyu_per_usd=40.0,
+    )
+    crudos = json.loads(row["datos_crudos"])
+    assert crudos["inmobiliaria"] == "Ejemplo Propiedades"
+    assert crudos["expensas"] == 3200
 
 
 def test_normalize_row_usd_listing_uses_fallback_rate():

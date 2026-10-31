@@ -45,6 +45,21 @@ RANDOM_SEED = 42
 TODAY = date(2026, 8, 1)  # fixed reference date so output is reproducible
 DATA_SOURCE = "synthetic"
 
+# Ancla de publicado_en de los *avisos* (el histórico sigue anclado a TODAY).
+# Tiene que ser la fecha real de la corrida, no TODAY: listings_unified
+# descarta los avisos con publicado_en más viejo que `max_listing_age_years`
+# (1 año, ver dbt/dbt_project.yml) y ese filtro se evalúa con current_date.
+# Anclado al TODAY fijo, el dataset sintético se va cayendo de la ventana a
+# medida que pasa el tiempo real -- en octubre de 2026 ya perdía 18 de los 52
+# avisos de Cordón 1 dormitorio (de ahí que market_stats no diera los números
+# del prototipo), y pasado un año de TODAY no entraría ninguno.
+LISTINGS_ANCHOR = date.today()
+# Antigüedad máxima de un aviso activo sintético: holgado dentro de la
+# ventana de vigencia. Los avisos de ruido (estados no activos) la pasan a
+# propósito, ver gen_listing_rows().
+MAX_ACTIVE_AGE_DAYS = 330
+EXPIRED_NOISE_AGE_DAYS = 540
+
 # Copied from frontend/src/screens/grupo2/S2A.jsx `MARKET` (2026-08-13).
 # min/med/max are in UYU/month. avisos = active listing count. yoy = year-over-year change.
 MARKET = {
@@ -100,14 +115,29 @@ def make_listing_id(counter: int) -> str:
 
 
 def gen_prices(min_p: int, med_p: int, max_p: int, n: int, rng: random.Random) -> list[float]:
-    """n prices in [min_p, max_p] with mode ~ med_p. Forces the exact min/max
-    into the sample so the recomputed aggregate reproduces the source bounds
-    exactly; the median will land close to (not exactly) med_p, which is
-    expected for synthetic data and is asserted with a tolerance downstream."""
+    """n precios en [min_p, max_p] cuya mediana cae en med_p por construcción:
+    el min y el max exactos van forzados a la muestra, y el resto se reparte
+    mitad abajo de med_p y mitad arriba, cada mitad con su propio triangular
+    centrado en el medio de su tramo.
+
+    Por qué no un solo triangular(min, max, mode=med) sobre toda la muestra,
+    que es lo que hacía antes: en zonas con pocos avisos la muestra salía
+    sesgada por azar (Tres Cruces 3+, 10 avisos: mediana 39.900 contra
+    34.000 de objetivo) y, sobre todo, quedaba apretada alrededor del modo.
+    Una muestra apretada tiene IQR chico, y con IQR chico el filtro de
+    outliers de market_listings (mediana +- 1.5*IQR) se come justamente el
+    min y el max forzados -- o sea que el pipeline terminaba reportando
+    bounds bastante más cerrados que los del prototipo que esta muestra
+    intenta reproducir. Repartir mitad y mitad da una mediana en el objetivo
+    y un IQR realista, con el que esos extremos ya no son outliers."""
     if n <= 2:
         return [min_p, max_p][:n]
-    middle = [round(rng.triangular(min_p, max_p, med_p), -2) for _ in range(n - 2)]
-    return [float(min_p), float(max_p), *middle]
+    middle_n = n - 2
+    below_n = middle_n // 2
+    # Sin mode explícito, random.triangular usa el medio del tramo.
+    below = [round(rng.triangular(min_p, med_p), -2) for _ in range(below_n)]
+    above = [round(rng.triangular(med_p, max_p), -2) for _ in range(middle_n - below_n)]
+    return [float(min_p), float(max_p), *below, *above]
 
 
 def gen_listing_rows(rng: random.Random, id_counter: list[int]) -> list[dict]:
@@ -118,7 +148,7 @@ def gen_listing_rows(rng: random.Random, id_counter: list[int]) -> list[dict]:
         lo, hi = METRAJE_RANGE[bucket]
         for precio in prices:
             id_counter[0] += 1
-            published_days_ago = rng.randint(1, 540)
+            published_days_ago = rng.randint(1, MAX_ACTIVE_AGE_DAYS)
             rows.append(
                 {
                     "listing_id": make_listing_id(id_counter[0]),
@@ -127,16 +157,20 @@ def gen_listing_rows(rng: random.Random, id_counter: list[int]) -> list[dict]:
                     "metraje_m2": rng.randint(lo, hi),
                     "precio": precio,
                     "estado": "activo",
-                    "publicado_en": (TODAY - timedelta(days=published_days_ago)).isoformat(),
+                    "publicado_en": (LISTINGS_ANCHOR - timedelta(days=published_days_ago)).isoformat(),
                 }
             )
         # noise: a few listings in this zone/bucket that are NOT active,
         # so market_stats must filter on estado rather than count everything.
+        # Van hasta EXPIRED_NOISE_AGE_DAYS a propósito: así una parte cae
+        # fuera de la ventana de vigencia y el filtro de antigüedad de
+        # listings_unified también queda ejercitado. No afecta a las
+        # estadísticas -- market_listings se queda solo con es_activo.
         noise_n = max(1, round(stats["avisos"] * INACTIVE_NOISE_RATE))
         for _ in range(noise_n):
             id_counter[0] += 1
             precio = round(rng.triangular(stats["min"], stats["max"], stats["med"]), -2)
-            published_days_ago = rng.randint(1, 540)
+            published_days_ago = rng.randint(1, EXPIRED_NOISE_AGE_DAYS)
             rows.append(
                 {
                     "listing_id": make_listing_id(id_counter[0]),
@@ -145,7 +179,7 @@ def gen_listing_rows(rng: random.Random, id_counter: list[int]) -> list[dict]:
                     "metraje_m2": rng.randint(lo, hi),
                     "precio": precio,
                     "estado": rng.choice(OTHER_ESTADOS),
-                    "publicado_en": (TODAY - timedelta(days=published_days_ago)).isoformat(),
+                    "publicado_en": (LISTINGS_ANCHOR - timedelta(days=published_days_ago)).isoformat(),
                 }
             )
 
@@ -162,7 +196,7 @@ def gen_listing_rows(rng: random.Random, id_counter: list[int]) -> list[dict]:
             price_lo, price_hi = (14000, 26000) if bucket == "1" else (20000, 38000)
             for _ in range(n):
                 id_counter[0] += 1
-                published_days_ago = rng.randint(1, 540)
+                published_days_ago = rng.randint(1, MAX_ACTIVE_AGE_DAYS)
                 rows.append(
                     {
                         "listing_id": make_listing_id(id_counter[0]),
@@ -171,7 +205,7 @@ def gen_listing_rows(rng: random.Random, id_counter: list[int]) -> list[dict]:
                         "metraje_m2": rng.randint(lo, hi),
                         "precio": round(rng.uniform(price_lo, price_hi), -2),
                         "estado": "activo",
-                        "publicado_en": (TODAY - timedelta(days=published_days_ago)).isoformat(),
+                        "publicado_en": (LISTINGS_ANCHOR - timedelta(days=published_days_ago)).isoformat(),
                     }
                 )
 
@@ -220,11 +254,21 @@ def add_ingestion_metadata(rows: list[dict]) -> None:
     for row in rows:
         row["fotos"] = ""
         row["foto_count"] = ""
-        # direccion/latitud/longitud: sin dato sintético -- ver
-        # scrape_infocasas.py, mismo contrato de columnas de bronze.
+        # direccion/latitud/longitud/banos/descripcion/amenities/datos_crudos:
+        # sin dato sintético -- ver scrape_infocasas.py, mismo contrato de
+        # columnas de bronze. Van vacías, no ausentes: los modelos de staging
+        # las castean (try_cast(banos as integer), try_cast(datos_crudos as
+        # json), string_split de amenities) y si la columna no existe en el
+        # CSV, dbt no bindea y la corrida entera falla -- no solo la columna
+        # faltante. Agregar una columna nueva a los extractores reales
+        # implica agregarla acá en el mismo cambio.
         row["direccion"] = ""
         row["latitud"] = ""
         row["longitud"] = ""
+        row["banos"] = ""
+        row["descripcion"] = ""
+        row["amenities"] = ""
+        row["datos_crudos"] = ""
         row["fuente_datos"] = DATA_SOURCE
         row["operacion"] = "alquiler"
         row["tipo_propiedad"] = "apartamentos"
