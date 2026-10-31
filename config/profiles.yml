@@ -1,0 +1,25 @@
+# Config centralizada de conexión para dbt. No hardcodea rutas ni credenciales:
+# todo sale de variables de entorno (ver .env.example en esta misma carpeta).
+#
+# Para correr dbt manualmente (fuera de pipelines/run_local.py), hay que
+# apuntar dbt a esta carpeta y tener las env vars cargadas:
+#   export DBT_PROFILES_DIR=$(pwd)/config
+#   export CUADRA_DUCKDB_PATH=$(pwd)/data/warehouse.duckdb
+#   cd dbt && uv run dbt run
+
+cuadra_data:
+  target: "{{ env_var('CUADRA_ENV', 'dev') }}"
+  outputs:
+    dev:
+      type: duckdb
+      path: "{{ env_var('CUADRA_DUCKDB_PATH') }}"
+      schema: main
+      threads: 4
+
+    # Target de producción: sin definir todavía (ver docs/business.md §8 y
+    # docs/roadmap.md). DuckDB es la elección para desarrollo local -- si
+    # producción necesita escritura concurrente desde el backend (no solo
+    # batch analítico), probablemente esto pase a ser Postgres u otro
+    # warehouse, cambiando solo este bloque, no los modelos dbt.
+    # prod:
+    #   type: postgres / snowflake / etc. -- TBD

@@ -1,0 +1,159 @@
+# Deploy del pipeline de datos a AWS (stack alquileres-<env>-pipeline).
+#
+# Pasos, en el orden del runbook (infra/README.md):
+#   1. tests
+#   2. armar los artefactos y subirlos a s3://<artefactos>/pipeline/<sha>/
+#        scraper-infocasas.zip / scraper-casasweb.zip / scraper-buscandocasa.zip
+#        transform.py        (script del job de Glue)
+#        deps.zip            (pg8000 y lo que el library-set analytics no trae)
+#   3. cloudformation deploy de infra/pipeline.yaml con CodeVersion=<sha>  <-- la infra siempre se aplica acá
+#   4. (opcional, manual) una corrida de validación de la state machine
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      correr_validacion:
+        description: Lanzar una corrida de la state machine al terminar el deploy
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-pipeline
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+  PROJECT: ${{ vars.PROJECT || 'alquileres' }}
+  ENVIRONMENT: ${{ vars.ENVIRONMENT || 'prd' }}
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups
+      - run: uv run pytest -q
+
+  deploy:
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Chequear configuración del repo
+        run: |
+          set -euo pipefail
+          faltan=()
+          [[ -n "${{ secrets.AWS_DEPLOY_ROLE_ARN }}" ]] || faltan+=("secret AWS_DEPLOY_ROLE_ARN")
+          [[ -n "${{ secrets.CFN_EXEC_ROLE_ARN }}" ]]   || faltan+=("secret CFN_EXEC_ROLE_ARN")
+          if (( ${#faltan[@]} )); then
+            printf 'Falta configurar en este repo:\n'
+            printf '  - %s\n' "${faltan[@]}"
+            echo 'Ver infra/README.md.'
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Un solo zip para las tres Lambdas: el código es el mismo y la fuente
+      # la elige la variable de entorno FUENTE que setea CloudFormation
+      # (ver lambdas/scraper/app.py). Se sube con los tres nombres que espera
+      # el template.
+      - name: Armar los zips de las Lambdas
+        run: |
+          set -euo pipefail
+          rm -rf build && mkdir -p build/scraper
+          cp lambdas/scraper/app.py build/scraper/
+          cp etl/extract/scrape_infocasas.py \
+             etl/extract/scrape_casasweb.py \
+             etl/extract/scrape_buscandocasa.py build/scraper/
+          cp -R src/cuadra_data build/scraper/
+          pip install --quiet --target build/scraper -r lambdas/requirements-lambda.txt
+          find build/scraper -name '__pycache__' -type d -prune -exec rm -rf {} +
+          (cd build/scraper && zip -qr ../scraper.zip .)
+          ls -l build/scraper.zip
+
+      - name: Armar deps.zip del job de Glue
+        run: |
+          set -euo pipefail
+          mkdir -p build/deps
+          pip install --quiet --target build/deps -r glue/requirements-glue.txt
+          find build/deps -name '__pycache__' -type d -prune -exec rm -rf {} +
+          (cd build/deps && zip -qr ../deps.zip .)
+          ls -l build/deps.zip
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Leer el bucket de artefactos del stack base
+        id: base
+        run: |
+          set -euo pipefail
+          bucket=$(aws cloudformation describe-stacks \
+            --stack-name "$PROJECT-$ENVIRONMENT-base" \
+            --query 'Stacks[0].Outputs[?OutputKey==`ArtifactsBucketName`].OutputValue' --output text)
+          echo "artifacts_bucket=$bucket" >> "$GITHUB_OUTPUT"
+
+      - name: Subir los artefactos
+        run: |
+          set -euo pipefail
+          destino="s3://${{ steps.base.outputs.artifacts_bucket }}/pipeline/${GITHUB_SHA}"
+          for fuente in infocasas casasweb buscandocasa; do
+            aws s3 cp build/scraper.zip "$destino/scraper-$fuente.zip"
+          done
+          aws s3 cp build/deps.zip "$destino/deps.zip"
+          aws s3 cp glue/transform.py "$destino/transform.py"
+
+      - name: CloudFormation deploy (pipeline)
+        run: |
+          set -euo pipefail
+          aws cloudformation deploy \
+            --stack-name "$PROJECT-$ENVIRONMENT-pipeline" \
+            --template-file infra/pipeline.yaml \
+            --role-arn "${{ secrets.CFN_EXEC_ROLE_ARN }}" \
+            --capabilities CAPABILITY_IAM \
+            --no-fail-on-empty-changeset \
+            --tags Project="$PROJECT" Environment="$ENVIRONMENT" Repo=cuadra-data \
+            --parameter-overrides \
+              Project="$PROJECT" \
+              Environment="$ENVIRONMENT" \
+              CodeVersion="$GITHUB_SHA" \
+              ${{ vars.SCHEDULE_EXPRESSION && format('ScheduleExpression={0}', vars.SCHEDULE_EXPRESSION) || '' }}
+
+      # Esperar al cron semanal para saber si el cambio anda es demasiado
+      # lento, pero una corrida completa escribe en raw/curated y en la DB:
+      # por eso es opt-in y manual.
+      - name: Corrida de validación
+        if: inputs.correr_validacion
+        run: |
+          set -euo pipefail
+          arn=$(aws cloudformation describe-stacks \
+            --stack-name "$PROJECT-$ENVIRONMENT-pipeline" \
+            --query 'Stacks[0].Outputs[?OutputKey==`StateMachineArn`].OutputValue' --output text)
+          ejecucion=$(aws stepfunctions start-execution --state-machine-arn "$arn" \
+            --input "{\"scheduled_time\": \"$(date -u +%Y-%m-%d)T00:00:00Z\"}" \
+            --query executionArn --output text)
+          echo "ejecución: $ejecucion"
+          for _ in $(seq 1 80); do
+            estado=$(aws stepfunctions describe-execution --execution-arn "$ejecucion" \
+              --query status --output text)
+            echo "estado: $estado"
+            [[ "$estado" == RUNNING ]] || { [[ "$estado" == SUCCEEDED ]] && exit 0 || exit 1; }
+            sleep 30
+          done
+          echo 'La corrida no terminó en 40 min: revisar en la consola.'
+          exit 1

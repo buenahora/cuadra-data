@@ -1,0 +1,96 @@
+version: 2
+
+models:
+  - name: listings_unified
+    description: >
+      Gold -- avisos individuales de las 3 fuentes (InfoCasas, Casasweb,
+      BuscandoCasa) mapeados a una estructura común, con fuente_datos para
+      distinguir el origen. Pensado como la tabla que lee la API en vez de
+      conocer el shape de cada fuente. Filtrado a solo alquiler (venta/
+      temporada afuera) y sin avisos tipo apartamento sin dormitorios (ver
+      docstring del modelo). Es también la fuente de market_stats/
+      market_snapshots/listing_market_position (filtrados ahí además a
+      tipo_propiedad='apartamento' -- ver docstring de market_stats.sql).
+    columns:
+      - name: listing_id
+        data_tests: [unique, not_null]
+      - name: fuente_datos
+        data_tests: [not_null]
+      - name: operacion
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["alquiler"]
+      - name: zone_id
+        data_tests: [not_null]
+      - name: direccion
+        description: >
+          Dirección de texto tal como la trae la fuente. Solo poblada para
+          InfoCasas hoy (NULL en Casasweb/BuscandoCasa -- no disponible en
+          esas fuentes, ver docstring del modelo).
+      - name: latitud
+        description: "Solo poblada para InfoCasas hoy, ver docstring del modelo."
+      - name: longitud
+        description: "Solo poblada para InfoCasas hoy, ver docstring del modelo."
+      - name: dormitorios_bucket
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["0", "1", "2", "3+"]
+              config:
+                where: "dormitorios_bucket is not null"
+
+  - name: market_listings
+    description: >
+      Avisos activos de apartamento en alquiler, sin outliers de precio por
+      zona+dormitorios (mediana ± 1.5*IQR -- ver docstring del modelo).
+      Fuente compartida de market_stats y listing_market_position.
+    columns:
+      - name: listing_id
+        data_tests: [unique, not_null]
+      - name: zone_id
+        data_tests: [not_null]
+
+  - name: market_stats
+    description: >
+      Mínimo/mediana/máximo y tamaño de muestra por zona+dormitorios, sobre
+      avisos activos. Contrato 1:1 con MarketStat en backend/app/schemas/market.py
+      (ver docstring del modelo) -- falta metraje_bucket (no hay esquema de
+      bucketing de m² definido todavía, ver docs/data-model.md §5) pero es
+      opcional en el schema del backend, no rompe nada, solo queda null.
+    columns:
+      - name: zone_id
+        data_tests: [not_null]
+      - name: dormitorios_bucket
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["0", "1", "2", "3+"]
+      - name: avisos_activos
+        data_tests: [not_null]
+      - name: precio_mediana
+        data_tests: [not_null]
+
+  - name: listing_market_position
+    description: Clasificación below/in/above por aviso activo, frente a la mediana de su zona+tipología.
+    columns:
+      - name: listing_id
+        data_tests: [unique, not_null]
+      - name: nivel_mercado
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["below", "in", "above"]
+              config:
+                where: "nivel_mercado is not null"
+
+  - name: market_snapshots
+    description: Serie histórica mensual de mediana por zona+tipología (histórico sembrado + punto calculado del mes actual).
+    columns:
+      - name: precio_mediana
+        data_tests: [not_null]
+      - name: fuente
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["historico_semilla", "calculado"]

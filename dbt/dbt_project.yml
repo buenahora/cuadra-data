@@ -1,0 +1,42 @@
+name: "cuadra_data"
+version: "1.0.0"
+config-version: 2
+
+profile: "cuadra_data"
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+vars:
+  # Umbral de clasificación below/in/above -- hoy hardcodeado en el prototipo
+  # frontend (frontend/src/screens/grupo2/S2D.jsx) al ±8% de la mediana.
+  # Ver docs/market-intelligence.md Sección 3.
+  market_below_threshold: 0.92 # precio < mediana * esto => 'below'
+  market_above_threshold: 1.08 # precio > mediana * esto => 'above'
+
+  # Avisos activos mínimos para confiar en una mediana. Ver
+  # docs/market-intelligence.md Sección 4/6, "arranque en frío" y "muestra
+  # insuficiente" -- no confirmado con datos reales, punto de partida a
+  # ajustar.
+  min_sample_size: 5
+
+  # Antigüedad máxima de publicado_en para que un aviso entre a
+  # listings_unified -- decidido 2026-08-15 tras auditoría de nulls/calidad:
+  # infocasas trae una cola larga de avisos con publicado_en de hasta 26 años
+  # (incluso placeholders tipo 2000-01-01), poco creíble para un alquiler
+  # activo. Ver dbt/models/marts/listings_unified.sql.
+  max_listing_age_years: 1
+
+models:
+  cuadra_data:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

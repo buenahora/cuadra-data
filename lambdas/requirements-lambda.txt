@@ -1,0 +1,3 @@
+# Dependencias de las Lambdas de scraping (los extractores de etl/extract/).
+# El CI las instala dentro del zip.
+requests>=2.31,<3

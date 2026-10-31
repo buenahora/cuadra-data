@@ -1,0 +1,4 @@
+# Dependencias que el job de Glue necesita y el library-set analytics no trae.
+# El CI las instala en un directorio y las sube como deps.zip
+# (--extra-py-files del TransformJob, ver infra/pipeline.yaml).
+pg8000>=1.31,<2

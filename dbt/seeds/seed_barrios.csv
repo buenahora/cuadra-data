@@ -1,0 +1,33 @@
+zone_id,barrio,ciudad,tiene_datos_semilla
+pocitos,Pocitos,Montevideo,true
+cordon,Cordón,Montevideo,true
+parque_rodo,Parque Rodó,Montevideo,true
+punta_carretas,Punta Carretas,Montevideo,true
+la_blanqueada,La Blanqueada,Montevideo,true
+tres_cruces,Tres Cruces,Montevideo,true
+palermo,Palermo,Montevideo,true
+buceo,Buceo,Montevideo,true
+malvin,Malvín,Montevideo,true
+carrasco,Carrasco,Montevideo,true
+centro,Centro,Montevideo,true
+ciudad_vieja,Ciudad Vieja,Montevideo,false
+prado,Prado,Montevideo,false
+sayago,Sayago,Montevideo,false
+cerro,Cerro,Montevideo,false
+parque_batlle,Parque Batlle,Montevideo,false
+aguada,Aguada,Montevideo,false
+union,Unión,Montevideo,false
+barrio_sur,Barrio Sur,Montevideo,false
+carrasco_norte,Carrasco Norte,Montevideo,false
+larranaga,Larrañaga,Montevideo,false
+punta_gorda,Punta Gorda,Montevideo,false
+jacinto_vera,Jacinto Vera,Montevideo,false
+la_comercial,La Comercial,Montevideo,false
+brazo_oriental,Brazo Oriental,Montevideo,false
+malvin_norte,Malvín Norte,Montevideo,false
+villa_munoz,Villa Muñoz,Montevideo,false
+reducto,Reducto,Montevideo,false
+capurro,Capurro,Montevideo,false
+belvedere,Belvedere,Montevideo,false
+la_teja,La Teja,Montevideo,false
+aires_puros,Aires Puros,Montevideo,false

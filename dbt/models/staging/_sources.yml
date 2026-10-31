@@ -1,0 +1,93 @@
+version: 2
+
+sources:
+  - name: raw
+    description: >
+      Tablas cargadas por etl/load/load_to_duckdb.py directamente en el
+      warehouse DuckDB, a partir de lo que produce etl/extract/. dbt no
+      escribe estas tablas, solo las lee.
+    schema: raw
+    tables:
+      - name: listings
+        description: >
+          Avisos individuales de InfoCasas (un aviso por fila) -- la unidad
+          atómica de la que se derivan todas las estadísticas de mercado.
+          Producidos por etl/extract/scrape_infocasas.py (real) o
+          etl/extract/generate_synthetic_listings.py (sintético, fallback de
+          desarrollo -- ambos escriben fuente_datos distinto para poder
+          distinguirlos). Ver docs/market-intelligence.md Sección 4. Mismo
+          contrato de columnas de bronze que listings_casasweb_* y
+          listings_buscandocasa (ver abajo) -- alquiler_apartamentos es el
+          único operacion+tipo_propiedad que cubre este extractor por corrida.
+          Trae fotos (string "|"-separado, galería completa) y foto_count
+          directo del mismo JSON que ya se descarga, sin request extra.
+          Desde 2026-08-15 también trae direccion/latitud/longitud, mismo
+          criterio -- ya venían en el JSON, no hacía falta pedirlas.
+        columns:
+          - name: listing_id
+            data_tests: [unique, not_null]
+          - name: barrio
+            data_tests: [not_null]
+          - name: dormitorios
+            data_tests: [not_null]
+          - name: precio
+            data_tests: [not_null]
+          - name: estado
+            data_tests: [not_null]
+          - name: fuente_datos
+            description: "'infocasas' o 'synthetic' -- de qué extractor salió esta fila."
+            data_tests: [not_null]
+
+      - name: listings_casasweb_alquiler_apartamentos
+        description: >
+          Avisos de alquiler de apartamentos de Casasweb (etl/extract/scrape_casasweb.py
+          --operation alquiler --property-type apartamentos). Mismo contrato
+          de bronze que raw.listings, más fuente_datos/operacion/tipo_propiedad/
+          ingestado_en. `estado` siempre 'activo' -- la API de Casasweb no
+          expone un flag confiable de avisos pausados (ver docstring del
+          extractor). fotos (un solo elemento, la portada) reversada contra
+          la página pública de detalle (no viene como URL en la API, solo
+          un ID) -- sin foto_count, la API no expone conteo de fotos.
+        columns:
+          - name: listing_id
+            data_tests: [unique, not_null]
+          - name: fuente_datos
+            data_tests: [not_null]
+
+      - name: listings_casasweb_alquiler_casas
+        description: >
+          Igual que listings_casasweb_alquiler_apartamentos pero
+          --property-type casas -- archivo separado porque cada corrida de
+          scrape_casasweb.py cubre una sola combinación operation+property-type.
+        columns:
+          - name: listing_id
+            data_tests: [unique, not_null]
+          - name: fuente_datos
+            data_tests: [not_null]
+
+      - name: listings_buscandocasa
+        description: >
+          Avisos de BuscandoCasa (etl/extract/scrape_buscandocasa.py) --
+          único extractor que mezcla las 21 combinaciones tipo×operación
+          (venta/alquiler/temporada × apartamento/casa/terreno/...) en un
+          solo archivo, por eso operacion/tipo_propiedad varían fila a fila
+          acá (a diferencia de listings y listings_casasweb_*, donde son
+          constantes por archivo). `precio` puede venir vacío en avisos de
+          temporada sin monto fijo ("CONSULTAR"/"RESERVADO") -- no se
+          descartan, ver memoria de proyecto sobre este extractor antes de
+          tocarlo. Trae fotos (un solo elemento, portada, resuelta a URL
+          absoluta) y foto_count desde la misma tarjeta ya descargada -- la
+          galería completa está solo en la ficha de detalle (no implementada).
+        columns:
+          - name: listing_id
+            data_tests: [unique, not_null]
+          - name: fuente_datos
+            data_tests: [not_null]
+
+      - name: market_history_seed
+        description: >
+          Histórico mensual pre-cargado (meses -12 a -1) que simula haber
+          capturado snapshots desde antes de que existiera la plataforma.
+          Ver docs/market-intelligence.md Sección 5 -- en producción real
+          esta tabla no existiría: el histórico se construye mes a mes hacia
+          adelante desde el día 1, no se puede reconstruir retroactivamente.

@@ -1,0 +1,611 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Pipeline de datos de la plataforma de alquileres. Buckets del data lake, Lambdas de
+  scraping, Glue Python shell, catálogo, Athena, Step Functions, Scheduler semanal y
+  alertas. Lo despliega el CI del repo del pipeline.
+
+Parameters:
+  Project:
+    Type: String
+    Default: alquileres
+  Environment:
+    Type: String
+    Default: prd
+    AllowedValues: [dev, prd]
+  CodeVersion:
+    Type: String
+    Description: Prefijo de la versión en el bucket de artefactos (por ejemplo el SHA del commit)
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 6 ? * MON *)
+    Description: Cuándo corre el pipeline, en hora de Montevideo
+
+Resources:
+  # ---------------------------------------------------------------- Data lake
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${Project}-${Environment}-raw-${AWS::AccountId}'
+      VersioningConfiguration: {Status: Enabled}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      LifecycleConfiguration:
+        Rules:
+          - Id: tiering-raw
+            Status: Enabled
+            Transitions:
+              - {StorageClass: STANDARD_IA, TransitionInDays: 30}
+              - {StorageClass: GLACIER, TransitionInDays: 90}
+            ExpirationInDays: 365
+            NoncurrentVersionExpiration: {NoncurrentDays: 30}
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 7}
+
+  CuratedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${Project}-${Environment}-curated-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      LifecycleConfiguration:
+        Rules:
+          - Id: multipart
+            Status: Enabled
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 7}
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${Project}-${Environment}-athena-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      LifecycleConfiguration:
+        Rules:
+          - {Id: expirar, Status: Enabled, ExpirationInDays: 7}
+
+  GlueTempBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${Project}-${Environment}-glue-temp-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      LifecycleConfiguration:
+        Rules:
+          - {Id: expirar, Status: Enabled, ExpirationInDays: 7}
+
+  # ---------------------------------------------------------------- Lambdas de scraping
+  ScraperRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: escribir-raw
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${RawBucket.Arn}/*'
+
+  InfoCasasFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Project}-${Environment}-scraper-infocasas'
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !GetAtt ScraperRole.Arn
+      MemorySize: 512
+      Timeout: 900
+      ReservedConcurrentExecutions: 1
+      Code:
+        S3Bucket:
+          Fn::ImportValue: !Sub '${Project}-${Environment}-ArtifactsBucket'
+        S3Key: !Sub 'pipeline/${CodeVersion}/scraper-infocasas.zip'
+      Environment:
+        Variables: {RAW_BUCKET: !Ref RawBucket, FUENTE: infocasas}
+  CasaswebFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Project}-${Environment}-scraper-casasweb'
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !GetAtt ScraperRole.Arn
+      MemorySize: 512
+      Timeout: 900
+      ReservedConcurrentExecutions: 1
+      Code:
+        S3Bucket:
+          Fn::ImportValue: !Sub '${Project}-${Environment}-ArtifactsBucket'
+        S3Key: !Sub 'pipeline/${CodeVersion}/scraper-casasweb.zip'
+      Environment:
+        Variables: {RAW_BUCKET: !Ref RawBucket, FUENTE: casasweb}
+  BuscandoCasaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Project}-${Environment}-scraper-buscandocasa'
+      Runtime: python3.12
+      Handler: app.handler
+      Role: !GetAtt ScraperRole.Arn
+      MemorySize: 512
+      Timeout: 900
+      ReservedConcurrentExecutions: 1
+      Code:
+        S3Bucket:
+          Fn::ImportValue: !Sub '${Project}-${Environment}-ArtifactsBucket'
+        S3Key: !Sub 'pipeline/${CodeVersion}/scraper-buscandocasa.zip'
+      Environment:
+        Variables: {RAW_BUCKET: !Ref RawBucket, FUENTE: buscandocasa}
+
+  InfoCasasLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${InfoCasasFunction}'
+      RetentionInDays: 30
+  CasaswebLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${CasaswebFunction}'
+      RetentionInDays: 30
+  BuscandoCasaLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${BuscandoCasaFunction}'
+      RetentionInDays: 30
+
+  # ---------------------------------------------------------------- Glue
+  GlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: glue.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: datos-del-pipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource: [!GetAtt RawBucket.Arn, !Sub '${RawBucket.Arn}/*']
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt CuratedBucket.Arn
+                  - !Sub '${CuratedBucket.Arn}/*'
+                  - !GetAtt GlueTempBucket.Arn
+                  - !Sub '${GlueTempBucket.Arn}/*'
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub
+                  - 'arn:aws:s3:::${Bucket}/pipeline/*'
+                  - Bucket:
+                      Fn::ImportValue: !Sub '${Project}-${Environment}-ArtifactsBucket'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  Fn::ImportValue: !Sub '${Project}-${Environment}-AppDbSecretArn'
+
+  # Una connection por AZ, para que la carga a RDS no dependa de una sola zona
+  GlueConnectionA:
+    Type: AWS::Glue::Connection
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      ConnectionInput:
+        Name: !Sub '${Project}-${Environment}-vpc-a'
+        ConnectionType: NETWORK
+        PhysicalConnectionRequirements:
+          SubnetId:
+            Fn::ImportValue: !Sub '${Project}-${Environment}-AppSubnetA'
+          AvailabilityZone:
+            Fn::ImportValue: !Sub '${Project}-${Environment}-AppSubnetAAz'
+          SecurityGroupIdList:
+            - Fn::ImportValue: !Sub '${Project}-${Environment}-GlueSG'
+  GlueConnectionB:
+    Type: AWS::Glue::Connection
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      ConnectionInput:
+        Name: !Sub '${Project}-${Environment}-vpc-b'
+        ConnectionType: NETWORK
+        PhysicalConnectionRequirements:
+          SubnetId:
+            Fn::ImportValue: !Sub '${Project}-${Environment}-AppSubnetB'
+          AvailabilityZone:
+            Fn::ImportValue: !Sub '${Project}-${Environment}-AppSubnetBAz'
+          SecurityGroupIdList:
+            - Fn::ImportValue: !Sub '${Project}-${Environment}-GlueSG'
+
+  TransformJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${Project}-${Environment}-transform'
+      Role: !GetAtt GlueRole.Arn
+      Command:
+        Name: pythonshell
+        PythonVersion: '3.9'
+        ScriptLocation: !Sub
+          - 's3://${Bucket}/pipeline/${CodeVersion}/transform.py'
+          - Bucket:
+              Fn::ImportValue: !Sub '${Project}-${Environment}-ArtifactsBucket'
+      MaxCapacity: 1
+      MaxRetries: 0
+      Timeout: 60
+      ExecutionProperty: {MaxConcurrentRuns: 1}
+      Connections:
+        Connections: [!Ref GlueConnectionA, !Ref GlueConnectionB]
+      DefaultArguments:
+        library-set: analytics
+        --TempDir: !Sub 's3://${GlueTempBucket}/temp/'
+        --raw_bucket: !Ref RawBucket
+        --curated_bucket: !Ref CuratedBucket
+        --db_secret_arn:
+          Fn::ImportValue: !Sub '${Project}-${Environment}-AppDbSecretArn'
+        --extra-py-files: !Sub
+          - 's3://${Bucket}/pipeline/${CodeVersion}/deps.zip'
+          - Bucket:
+              Fn::ImportValue: !Sub '${Project}-${Environment}-ArtifactsBucket'
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${Project}_${Environment}'
+        Description: Data lake de avisos de alquiler
+
+  # Tabla de avisos limpios. Esquema inicial de ejemplo, ajustar a lo que produzca Glue.
+  # Partition projection evita registrar particiones a mano o con un crawler.
+  AvisosTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: avisos
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          projection.enabled: 'true'
+          projection.fecha.type: date
+          projection.fecha.format: yyyy-MM-dd
+          projection.fecha.range: 2026-01-01,NOW
+          projection.fecha.interval: '1'
+          projection.fecha.interval.unit: DAYS
+          storage.location.template: !Sub 's3://${CuratedBucket}/avisos/fecha=${!fecha}/'
+        PartitionKeys:
+          - {Name: fecha, Type: string}
+        StorageDescriptor:
+          Location: !Sub 's3://${CuratedBucket}/avisos/'
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - {Name: fuente, Type: string}
+            - {Name: id_aviso, Type: string}
+            - {Name: url, Type: string}
+            - {Name: barrio, Type: string}
+            - {Name: tipologia, Type: string}
+            - {Name: dormitorios, Type: int}
+            - {Name: metros, Type: double}
+            - {Name: precio, Type: double}
+            - {Name: moneda, Type: string}
+            - {Name: hash_contenido, Type: string}
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub '${Project}-${Environment}'
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 1073741824
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${AthenaResultsBucket}/'
+
+  # ---------------------------------------------------------------- Orquestación
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: states.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: orquestar
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt InfoCasasFunction.Arn
+                  - !GetAtt CasaswebFunction.Arn
+                  - !GetAtt BuscandoCasaFunction.Arn
+              - Effect: Allow
+                Action: [glue:StartJobRun, glue:GetJobRun, glue:GetJobRuns, glue:BatchStopJobRun]
+                Resource: !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${TransformJob}'
+              - Effect: Allow
+                Action: sns:Publish
+                Resource:
+                  Fn::ImportValue: !Sub '${Project}-${Environment}-AlertsTopicArn'
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${Project}-${Environment}-corrida-semanal'
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StateMachineRole.Arn
+      DefinitionSubstitutions:
+        InfoCasasArn: !GetAtt InfoCasasFunction.Arn
+        CasaswebArn: !GetAtt CasaswebFunction.Arn
+        BuscandoCasaArn: !GetAtt BuscandoCasaFunction.Arn
+        GlueJobName: !Ref TransformJob
+        AlertsTopicArn:
+          Fn::ImportValue: !Sub '${Project}-${Environment}-AlertsTopicArn'
+      Definition:
+        Comment: Corrida semanal, scraping en paralelo y luego transformación con Glue
+        TimeoutSeconds: 7200
+        StartAt: PrepararFecha
+        States:
+          # La fecha de la corrida sale de la hora programada por el Scheduler.
+          # Todas las escrituras usan esa fecha en sus claves: relanzar la misma
+          # semana pisa los mismos archivos en lugar de duplicarlos.
+          PrepararFecha:
+            Type: Pass
+            Parameters:
+              fecha.$: States.ArrayGetItem(States.StringSplit($.scheduled_time, 'T'), 0)
+            Next: Scraping
+          Scraping:
+            Type: Parallel
+            ResultPath: $.scraping
+            Next: Transformar
+            Branches:
+              - StartAt: InfoCasas
+                States:
+                  InfoCasas:
+                    Type: Task
+                    Resource: arn:aws:states:::lambda:invoke
+                    Parameters:
+                      FunctionName: ${InfoCasasArn}
+                      Payload:
+                        fecha.$: $.fecha
+                    ResultSelector: {fuente: infocasas, estado: ok}
+                    TimeoutSeconds: 960
+                    Retry:
+                      - ErrorEquals: [States.ALL]
+                        IntervalSeconds: 60
+                        BackoffRate: 2
+                        MaxAttempts: 2
+                    Catch:
+                      - ErrorEquals: [States.ALL]
+                        ResultPath: $.error
+                        Next: AvisarInfoCasas
+                    End: true
+                  AvisarInfoCasas:
+                    Type: Task
+                    Resource: arn:aws:states:::sns:publish
+                    Parameters:
+                      TopicArn: ${AlertsTopicArn}
+                      Subject: Fallo una fuente del pipeline
+                      Message.$: States.Format('Fallo InfoCasas en la corrida del {}. Glue procesa las otras fuentes.', $.fecha)
+                    ResultSelector: {fuente: infocasas, estado: fallida}
+                    End: true
+              - StartAt: Casasweb
+                States:
+                  Casasweb:
+                    Type: Task
+                    Resource: arn:aws:states:::lambda:invoke
+                    Parameters:
+                      FunctionName: ${CasaswebArn}
+                      Payload:
+                        fecha.$: $.fecha
+                    ResultSelector: {fuente: casasweb, estado: ok}
+                    TimeoutSeconds: 960
+                    Retry:
+                      - ErrorEquals: [States.ALL]
+                        IntervalSeconds: 60
+                        BackoffRate: 2
+                        MaxAttempts: 2
+                    Catch:
+                      - ErrorEquals: [States.ALL]
+                        ResultPath: $.error
+                        Next: AvisarCasasweb
+                    End: true
+                  AvisarCasasweb:
+                    Type: Task
+                    Resource: arn:aws:states:::sns:publish
+                    Parameters:
+                      TopicArn: ${AlertsTopicArn}
+                      Subject: Fallo una fuente del pipeline
+                      Message.$: States.Format('Fallo Casasweb en la corrida del {}. Glue procesa las otras fuentes.', $.fecha)
+                    ResultSelector: {fuente: casasweb, estado: fallida}
+                    End: true
+              - StartAt: BuscandoCasa
+                States:
+                  BuscandoCasa:
+                    Type: Task
+                    Resource: arn:aws:states:::lambda:invoke
+                    Parameters:
+                      FunctionName: ${BuscandoCasaArn}
+                      Payload:
+                        fecha.$: $.fecha
+                    ResultSelector: {fuente: buscandocasa, estado: ok}
+                    TimeoutSeconds: 960
+                    Retry:
+                      - ErrorEquals: [States.ALL]
+                        IntervalSeconds: 60
+                        BackoffRate: 2
+                        MaxAttempts: 2
+                    Catch:
+                      - ErrorEquals: [States.ALL]
+                        ResultPath: $.error
+                        Next: AvisarBuscandoCasa
+                    End: true
+                  AvisarBuscandoCasa:
+                    Type: Task
+                    Resource: arn:aws:states:::sns:publish
+                    Parameters:
+                      TopicArn: ${AlertsTopicArn}
+                      Subject: Fallo una fuente del pipeline
+                      Message.$: States.Format('Fallo BuscandoCasa en la corrida del {}. Glue procesa las otras fuentes.', $.fecha)
+                    ResultSelector: {fuente: buscandocasa, estado: fallida}
+                    End: true
+          Transformar:
+            Type: Task
+            Resource: arn:aws:states:::glue:startJobRun.sync
+            Parameters:
+              JobName: ${GlueJobName}
+              Arguments:
+                --fecha.$: $.fecha
+            ResultPath: $.glue
+            Retry:
+              - ErrorEquals: [States.TaskFailed]
+                IntervalSeconds: 300
+                MaxAttempts: 1
+            End: true
+
+  # ---------------------------------------------------------------- Scheduler
+  SchedulerDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Project}-${Environment}-scheduler-dlq'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: scheduler.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: {aws:SourceAccount: !Ref AWS::AccountId}
+      Policies:
+        - PolicyName: iniciar-corrida
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref StateMachine
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt SchedulerDlq.Arn
+
+  WeeklySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${Project}-${Environment}-semanal'
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: America/Montevideo
+      FlexibleTimeWindow: {Mode: 'OFF'}
+      State: ENABLED
+      Target:
+        Arn: !Ref StateMachine
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"scheduled_time": "<aws.scheduler.scheduled-time>"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 5
+          MaximumEventAgeInSeconds: 3600
+        DeadLetterConfig:
+          Arn: !GetAtt SchedulerDlq.Arn
+
+  # ---------------------------------------------------------------- Alertas
+  SchedulerDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: El Scheduler no pudo iniciar la corrida semanal
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - {Name: QueueName, Value: !GetAtt SchedulerDlq.QueueName}
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - Fn::ImportValue: !Sub '${Project}-${Environment}-AlertsTopicArn'
+
+  ExecutionFailedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Corrida semanal terminada con error
+      EventPattern:
+        source: [aws.states]
+        detail-type: [Step Functions Execution Status Change]
+        detail:
+          status: [FAILED, TIMED_OUT, ABORTED]
+          stateMachineArn: [!Ref StateMachine]
+      Targets:
+        - Id: alertas
+          Arn:
+            Fn::ImportValue: !Sub '${Project}-${Environment}-AlertsTopicArn'
+
+  GlueFailedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Job de Glue terminado con error
+      EventPattern:
+        source: [aws.glue]
+        detail-type: [Glue Job State Change]
+        detail:
+          jobName: [!Ref TransformJob]
+          state: [FAILED, TIMEOUT, ERROR]
+      Targets:
+        - Id: alertas
+          Arn:
+            Fn::ImportValue: !Sub '${Project}-${Environment}-AlertsTopicArn'
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref StateMachine
+  RawBucketName:
+    Value: !Ref RawBucket
+  CuratedBucketName:
+    Value: !Ref CuratedBucket
+  AthenaWorkGroupName:
+    Value: !Ref AthenaWorkGroup

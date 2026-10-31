@@ -1,0 +1,83 @@
+version: 2
+
+models:
+  - name: stg_listings
+    description: >
+      Avisos individuales de InfoCasas/sintético normalizados -- un aviso por
+      fila, con zona normalizada, bucket de dormitorios calculado y precio
+      redondeado a un decimal único. Ver stg_listings_casasweb y
+      stg_listings_buscandocasa para las otras dos fuentes -- mismo shape de
+      salida, sin unificar todavía en un solo modelo (eso es el mart gold
+      listings_unified).
+    columns:
+      - name: listing_id
+        data_tests: [unique, not_null]
+      - name: fuente_datos
+        data_tests: [not_null]
+      - name: zone_id
+        data_tests: [not_null]
+      - name: dormitorios_bucket
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["0", "1", "2", "3+"]
+      - name: estado
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["activo", "pausado", "alquilada", "en_proceso"]
+
+  - name: stg_listings_casasweb
+    description: >
+      Avisos de Casasweb normalizados (union de alquiler_apartamentos +
+      alquiler_casas), mismo shape que stg_listings. `estado` siempre
+      'activo' -- Casasweb no expone flag de pausado (ver _sources.yml).
+    columns:
+      - name: listing_id
+        data_tests: [unique, not_null]
+      - name: fuente_datos
+        data_tests: [not_null]
+      - name: zone_id
+        data_tests: [not_null]
+      - name: dormitorios_bucket
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["0", "1", "2", "3+"]
+              config:
+                where: "dormitorios_bucket is not null"
+
+  - name: stg_listings_buscandocasa
+    description: >
+      Avisos de BuscandoCasa normalizados, mismo shape que stg_listings.
+      A diferencia de las otras dos fuentes, dormitorios/precio pueden ser
+      NULL (tipos de propiedad donde no aplica, avisos de temporada sin
+      precio fijo) y operacion/tipo_propiedad varían fila a fila -- ver
+      docstring del modelo.
+    columns:
+      - name: listing_id
+        data_tests: [unique, not_null]
+      - name: fuente_datos
+        data_tests: [not_null]
+      - name: zone_id
+        data_tests: [not_null]
+      - name: dormitorios_bucket
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["0", "1", "2", "3+"]
+              config:
+                where: "dormitorios_bucket is not null"
+
+  - name: stg_market_history
+    description: Histórico mensual de mediana por zona+tipología, normalizado.
+    columns:
+      - name: zone_id
+        data_tests: [not_null]
+      - name: dormitorios_bucket
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["0", "1", "2", "3+"]
+      - name: precio_mediana
+        data_tests: [not_null]

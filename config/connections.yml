@@ -1,0 +1,37 @@
+# Documento de referencia legible: qué conexiones existen y para qué sirve
+# cada una. dbt no lee este archivo directamente (lee config/profiles.yml,
+# que a su vez lee las env vars documentadas acá) -- este es el punto donde
+# alguien nuevo en el equipo entiende de un vistazo qué hay conectado a qué,
+# sin tener que leer código.
+
+environments:
+  dev:
+    descripcion: Desarrollo local. Warehouse analítico = archivo DuckDB local, sin infraestructura que levantar.
+    warehouse:
+      tipo: duckdb
+      env_var: CUADRA_DUCKDB_PATH
+      default: ./data/warehouse.duckdb
+    fuente_de_datos: >
+      pipelines/run_local_real.py (real, InfoCasas/Casasweb/BuscandoCasa
+      scrapeados -- lo que lee el backend en dev normalmente) o
+      pipelines/run_local.py (sintética, etl/extract/generate_synthetic_listings.py,
+      ver docs/market-intelligence.md §4). Ambos comparten env/entorno "dev"
+      pero NO warehouse: el sintético escribe a
+      ./data/warehouse_synthetic.duckdb, aislado del default de arriba --
+      antes escribían al mismo archivo y correr el sintético sobre un
+      warehouse con datos reales los borraba sin aviso (incidente 2026-08-20,
+      ver docstring de pipelines/run_local.py).
+
+  prod:
+    descripcion: No definido todavía. Ver docs/business.md §8 (estrategia de datos de mercado no decidida) y docs/roadmap.md Fase 2.
+    warehouse:
+      tipo: TBD (Postgres / Snowflake / BigQuery / seguir con DuckDB -- a decidir según volumen real)
+    fuente_de_datos: TBD (avisos propios de la plataforma, posible ingesta externa, o híbrido)
+
+apis_externas:
+  # Placeholder -- si en el futuro se ingieren datos de portales externos
+  # (Gallito/Infocasas/MercadoLibre, ver docs/market-intelligence.md §4) o se
+  # usa un servicio de geocoding real, sus credenciales/endpoints se
+  # documentan acá y se leen desde env vars, igual que el warehouse.
+  geocoding: TBD
+  fuente_externa_listados: TBD

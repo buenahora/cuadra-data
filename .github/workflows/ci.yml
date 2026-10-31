@@ -1,0 +1,36 @@
+# CI de la data layer: corre en cada PR y en cada rama que no sea main.
+# No toca AWS. El deploy real está en deploy.yml.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups
+      # Tests de los extractores (con HTML/JSON de ejemplo, sin red) y del
+      # pipeline de punta a punta sobre datos sintéticos.
+      - run: uv run pytest -q
+      # dbt parse valida modelos, macros y refs sin construir nada.
+      - name: dbt parse
+        run: uv run python -c "import pathlib, subprocess, sys; from cuadra_data.config import dbt_subprocess_env, get_dbt_project_dir; sys.exit(subprocess.call(['dbt', 'parse'], cwd=get_dbt_project_dir(), env=dbt_subprocess_env()))"
+      # El código que se despliega como Lambda/Glue no entra en pytest.
+      - run: uv run python -m compileall -q lambdas glue
+
+  infra:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install cfn-lint
+      - run: cfn-lint infra/pipeline.yaml

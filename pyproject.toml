@@ -1,0 +1,35 @@
+[project]
+name = "cuadra-data-layer"
+version = "0.1.0"
+description = "Data layer for Cuadra: ETL, dbt transforms, and orchestration for the market-intelligence engine."
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "duckdb>=1.1,<2",
+    "dbt-core>=1.8,<2",
+    "dbt-duckdb>=1.8,<2",
+    "pandas>=2.2,<3",
+    "pyyaml>=6.0,<7",
+    "python-dotenv>=1.0,<2",
+    "requests>=2.31,<3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0,<9",
+]
+# No instalado por defecto -- ver pipelines/dags/market_stats_dag.py para
+# por qué Airflow todavía no está desplegado. `uv sync --group airflow`
+# cuando llegue el momento de levantarlo de verdad.
+airflow = [
+    "apache-airflow>=2.9,<3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cuadra_data"]

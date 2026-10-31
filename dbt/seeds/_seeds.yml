@@ -1,0 +1,27 @@
+version: 2
+
+seeds:
+  - name: seed_barrios
+    description: >
+      Catálogo de barrios/zonas (data-model.md Sección 5). `tiene_datos_semilla`
+      indica si el histórico sembrado (market_history_seed.csv / MARKET dict
+      en etl/extract/generate_synthetic_listings.py) cubre ese barrio -- solo
+      los primeros 11 lo tienen; el resto (agregados el 2026-08-14 a partir
+      del volumen real de las 3 fuentes, ver conversación) queda en false a
+      propósito: no hay con qué calcular variacion_interanual_pct para
+      zonas que no existían en el prototipo original.
+    columns:
+      - name: zone_id
+        data_tests: [unique, not_null]
+
+  - name: seed_amenities
+    description: Catálogo de comodidades/amenities (data-model.md Sección 4), hoy hardcodeado en frontend/src/screens/grupo2/S2C.jsx.
+    columns:
+      - name: amenity_id
+        data_tests: [unique, not_null]
+
+  - name: seed_garantias
+    description: Catálogo de garantías de alquiler aceptadas (data-model.md Sección 4), hoy hardcodeado en frontend/src/screens/grupo2/S2D.jsx.
+    columns:
+      - name: garantia_id
+        data_tests: [unique, not_null]

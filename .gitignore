@@ -1,0 +1,39 @@
+# Entorno Python (uv)
+.venv/
+__pycache__/
+*.pyc
+
+# Warehouse local y datos generados -- reproducibles corriendo
+# pipelines/run_local_real.py (real) o pipelines/run_local.py (sintético,
+# en su propia ruta -- ver docstring de ese script), no se versionan.
+data/raw/*.csv
+data/raw_synthetic/*.csv
+data/processed/*
+!data/processed/.gitkeep
+data/*.duckdb
+data/*.duckdb.wal
+
+# dbt
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+config/.user.yml
+
+# Secretos locales (ver config/.env.example)
+.env
+
+# pytest / cobertura
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Airflow (cuando se active -- ver pipelines/dags/)
+airflow.db
+airflow.cfg
+airflow-webserver.pid
+logs/
+
+.DS_Store
+
+# Artefactos del CI (deploy.yml)
+build/
