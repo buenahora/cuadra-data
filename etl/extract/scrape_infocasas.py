@@ -45,11 +45,14 @@ el sitio exponga un cursor/orden compuesto que no tiene.
 
 Run: uv run python etl/extract/scrape_infocasas.py
      uv run python etl/extract/scrape_infocasas.py --max-pages 5   # muestra rápida
+     uv run python etl/extract/scrape_infocasas.py --orders 1 --start-page 101 --max-pages 100 \
+         --out /tmp/tanda.csv                                      # una tanda sola (lo que corre la Lambda)
 """
 
 import argparse
 import csv
 import json
+import math
 import re
 import sys
 import time
@@ -217,6 +220,41 @@ def normalize_row(item: dict, fallback_rate: list[float]) -> dict | None:
     }
 
 
+def plan_pages(
+    session: requests.Session, operation: str, property_type: str, city: str, order: int
+) -> int:
+    """Cuántas páginas tiene hoy este orden. Pega una sola vez a la página 1 y
+    lee `paginatorInfo`. Lo usa el paso de planificación del pipeline
+    (lambdas/scraper/app.py) para decidir en cuántas tandas se parte la
+    corrida: el total de avisos del sitio cambia semana a semana, así que el
+    plan se calcula en cada corrida en vez de quedar fijo en el template."""
+    url = category_url(operation, property_type, city, 1, order)
+    if not robots_allows(session, url):
+        raise RuntimeError(
+            f"robots.txt de {BASE_HOST} no permite crawlear {url} -- abortando. "
+            "Revisar docs/scraping-strategy.md antes de forzar esto."
+        )
+
+    result = fetch_page(session, url)
+    if result is None:
+        raise RuntimeError(f"no se pudo leer la primera página de order={order} ({url})")
+
+    paginator = result["paginatorInfo"]
+    if paginator.get("lastPage"):
+        return int(paginator["lastPage"])
+
+    # Sin lastPage: se deduce del total que reporta el sitio y del tamaño de
+    # página observado (hoy ~21 avisos por página).
+    total = paginator.get("total")
+    por_pagina = len(result["data"])
+    if not total or not por_pagina:
+        raise RuntimeError(
+            f"paginatorInfo de order={order} no trae ni lastPage ni total/data "
+            f"usables: {paginator}"
+        )
+    return math.ceil(total / por_pagina)
+
+
 def scrape_one_order(
     session: requests.Session,
     operation: str,
@@ -226,11 +264,18 @@ def scrape_one_order(
     max_pages: int | None,
     delay: float,
     rows: dict[str, dict],
+    start_page: int = 1,
 ) -> tuple[int, int]:
-    """Pagina un único orden de principio a fin, agregando a `rows` (mutada
+    """Pagina un único orden desde `start_page`, agregando a `rows` (mutada
     in-place, compartida entre pasadas de distinto orden para dedupear).
     Devuelve (nominal_total de esta pasada, avisos descartados por datos
-    incompletos)."""
+    incompletos).
+
+    `start_page` + `max_pages` acotan la pasada a una tanda de páginas. Lo
+    usa la Lambda del pipeline (lambdas/scraper/app.py): una corrida completa
+    tarda ~18 min y el timeout máximo de Lambda es 15, así que se parte en
+    tandas que corren una después de la otra. En local no hace falta tocarlo
+    (default: desde la página 1 hasta el final)."""
     first_url = category_url(operation, property_type, city, 1, order)
     if not robots_allows(session, first_url):
         raise RuntimeError(
@@ -239,13 +284,16 @@ def scrape_one_order(
         )
 
     fallback_rate = [DEFAULT_FALLBACK_UYU_PER_USD]
-    page = 1
+    page = start_page
+    # Última página de la tanda (inclusive). None = hasta que el sitio diga
+    # que no hay más.
+    last_page = None if max_pages is None else start_page + max_pages - 1
     consecutive_failures = 0
     skipped_incomplete = 0  # normalize_row devolvió None: sin barrio, sin dormitorios o sin precio
     nominal_total = None  # 'total' que reporta el sitio en la primera página (referencia, no garantía)
 
     while True:
-        if max_pages is not None and page > max_pages:
+        if last_page is not None and page > last_page:
             break
 
         url = category_url(operation, property_type, city, page, order)
@@ -293,6 +341,7 @@ def scrape(
     max_pages: int | None,
     delay: float,
     orders: tuple[int, ...] = STABLE_ORDERS,
+    start_page: int = 1,
 ) -> list[dict]:
     """Pagina cada orden en `orders` por separado y combina los resultados
     dedupeados por listing_id (ver docstring del módulo: un solo orden deja
@@ -307,7 +356,7 @@ def scrape(
 
     for order in orders:
         pass_nominal_total, skipped_incomplete = scrape_one_order(
-            session, operation, property_type, city, order, max_pages, delay, rows
+            session, operation, property_type, city, order, max_pages, delay, rows, start_page
         )
         nominal_total = nominal_total or pass_nominal_total
         total_skipped_incomplete += skipped_incomplete
@@ -371,16 +420,39 @@ def main():
     parser.add_argument("--property-type", default="apartamentos")
     parser.add_argument("--city", default="montevideo")
     parser.add_argument("--max-pages", type=int, default=None, help="límite de páginas (default: todas)")
+    parser.add_argument(
+        "--start-page", type=int, default=1, help="primera página de la tanda (default: 1) -- ver scrape_one_order"
+    )
+    parser.add_argument(
+        "--orders",
+        nargs="*",
+        type=int,
+        default=list(STABLE_ORDERS),
+        help=f"órdenes a recorrer (default: {' '.join(str(o) for o in STABLE_ORDERS)}) -- ver docstring del módulo",
+    )
+    parser.add_argument(
+        "--out", default=None, help="CSV de salida (default: data/raw/listings.csv)"
+    )
     parser.add_argument("--delay", type=float, default=DEFAULT_DELAY_SECONDS, help="segundos entre requests")
     args = parser.parse_args()
 
-    rows = scrape(args.operation, args.property_type, args.city, args.max_pages, args.delay)
+    out_path = Path(args.out) if args.out else DATA_LAYER_ROOT / "data" / "raw" / "listings.csv"
+
+    rows = scrape(
+        args.operation,
+        args.property_type,
+        args.city,
+        args.max_pages,
+        args.delay,
+        tuple(args.orders),
+        args.start_page,
+    )
     if not rows:
-        print("No se obtuvo ningún aviso -- no se sobreescribe data/raw/listings.csv", file=sys.stderr)
+        print(f"No se obtuvo ningún aviso -- no se sobreescribe {out_path}", file=sys.stderr)
         sys.exit(1)
 
     add_ingestion_metadata(rows, args.operation, args.property_type)
-    write_csv(DATA_LAYER_ROOT / "data" / "raw" / "listings.csv", rows)
+    write_csv(out_path, rows)
 
 
 if __name__ == "__main__":

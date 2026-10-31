@@ -3,9 +3,9 @@
 # Pasos, en el orden del runbook (infra/README.md):
 #   1. tests
 #   2. armar los artefactos y subirlos a s3://<artefactos>/pipeline/<sha>/
-#        scraper-infocasas.zip / scraper-casasweb.zip / scraper-buscandocasa.zip
-#        transform.py        (script del job de Glue)
-#        deps.zip            (pg8000 y lo que el library-set analytics no trae)
+#        scraper-infocasas.zip  (extractor + handler de la Lambda)
+#        transform.py           (script del job de Glue)
+#        deps.zip               (pg8000 y lo que el library-set analytics no trae)
 #   3. cloudformation deploy de infra/pipeline.yaml con CodeVersion=<sha>  <-- la infra siempre se aplica acá
 #   4. (opcional, manual) una corrida de validación de la state machine
 name: Deploy
@@ -67,23 +67,33 @@ jobs:
         with:
           python-version: '3.12'
 
-      # Un solo zip para las tres Lambdas: el código es el mismo y la fuente
-      # la elige la variable de entorno FUENTE que setea CloudFormation
-      # (ver lambdas/scraper/app.py). Se sube con los tres nombres que espera
-      # el template.
-      - name: Armar los zips de las Lambdas
+      # El zip lleva el extractor tal cual está en etl/extract/ -- el mismo
+      # que corre en local -- más el handler y sus dependencias.
+      - name: Armar el zip de la Lambda
         run: |
           set -euo pipefail
           rm -rf build && mkdir -p build/scraper
           cp lambdas/scraper/app.py build/scraper/
-          cp etl/extract/scrape_infocasas.py \
-             etl/extract/scrape_casasweb.py \
-             etl/extract/scrape_buscandocasa.py build/scraper/
+          cp etl/extract/scrape_infocasas.py build/scraper/
           cp -R src/cuadra_data build/scraper/
           pip install --quiet --target build/scraper -r lambdas/requirements-lambda.txt
           find build/scraper -name '__pycache__' -type d -prune -exec rm -rf {} +
-          (cd build/scraper && zip -qr ../scraper.zip .)
-          ls -l build/scraper.zip
+          (cd build/scraper && zip -qr ../scraper-infocasas.zip .)
+          ls -l build/scraper-infocasas.zip
+
+      # Una dependencia que falte no se nota al empaquetar: explota en el cold
+      # start de la primera corrida, una semana después del deploy. Importar
+      # el handler desde el zip armado lo detecta acá.
+      - name: Probar que el zip importa
+        run: |
+          set -euo pipefail
+          python -c "
+          import sys
+          sys.path.insert(0, 'build/scraper')
+          import app
+          assert app.handler and app.tandas_de(10, 4)
+          print('import del handler OK')
+          "
 
       - name: Armar deps.zip del job de Glue
         run: |
@@ -112,9 +122,7 @@ jobs:
         run: |
           set -euo pipefail
           destino="s3://${{ steps.base.outputs.artifacts_bucket }}/pipeline/${GITHUB_SHA}"
-          for fuente in infocasas casasweb buscandocasa; do
-            aws s3 cp build/scraper.zip "$destino/scraper-$fuente.zip"
-          done
+          aws s3 cp build/scraper-infocasas.zip "$destino/scraper-infocasas.zip"
           aws s3 cp build/deps.zip "$destino/deps.zip"
           aws s3 cp glue/transform.py "$destino/transform.py"
 
@@ -132,7 +140,8 @@ jobs:
               Project="$PROJECT" \
               Environment="$ENVIRONMENT" \
               CodeVersion="$GITHUB_SHA" \
-              ${{ vars.SCHEDULE_EXPRESSION && format('ScheduleExpression={0}', vars.SCHEDULE_EXPRESSION) || '' }}
+              ${{ vars.SCHEDULE_EXPRESSION && format('ScheduleExpression={0}', vars.SCHEDULE_EXPRESSION) || '' }} \
+              ${{ vars.PAGINAS_POR_TANDA && format('PaginasPorTanda={0}', vars.PAGINAS_POR_TANDA) || '' }}
 
       # Esperar al cron semanal para saber si el cambio anda es demasiado
       # lento, pero una corrida completa escribe en raw/curated y en la DB:

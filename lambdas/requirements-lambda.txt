@@ -1,3 +1,9 @@
-# Dependencias de las Lambdas de scraping (los extractores de etl/extract/).
-# El CI las instala dentro del zip.
+# Dependencias de la Lambda de scraping, instaladas dentro del zip por el CI.
+# requests: lo usa el extractor (etl/extract/scrape_infocasas.py).
+# pyyaml + python-dotenv: los importa cuadra_data.config, que el extractor
+#   importa para resolver DATA_LAYER_ROOT. Sin estos dos el import falla en el
+#   cold start de la Lambda, no al empaquetar -- por eso el deploy hace un
+#   import de prueba del zip antes de subirlo.
 requests>=2.31,<3
+pyyaml>=6.0,<7
+python-dotenv>=1.0,<2

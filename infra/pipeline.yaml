@@ -19,6 +19,14 @@ Parameters:
     Type: String
     Default: cron(0 6 ? * MON *)
     Description: Cuándo corre el pipeline, en hora de Montevideo
+  PaginasPorTanda:
+    Type: Number
+    Default: 150
+    MinValue: 1
+    Description: >
+      Páginas que baja cada invocación de la Lambda de scraping. A 1,2 s por
+      request, 150 páginas son ~5 min: holgado contra el timeout de 15 min de
+      Lambda. Bajarlo si el sitio responde más lento.
 
 Resources:
   # ---------------------------------------------------------------- Data lake
@@ -117,6 +125,10 @@ Resources:
                 Action: s3:PutObject
                 Resource: !Sub '${RawBucket.Arn}/*'
 
+  # Una sola función para los dos modos del extractor (planificar las tandas
+  # y correr una tanda) -- ver lambdas/scraper/app.py. Sumar una fuente nueva
+  # es agregar otra función igual a esta, con su FUENTE, y otra rama en el
+  # Parallel de la state machine (ver infra/README.md).
   InfoCasasFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -125,61 +137,28 @@ Resources:
       Handler: app.handler
       Role: !GetAtt ScraperRole.Arn
       MemorySize: 512
+      # 15 min, el máximo de Lambda. Cada tanda está dimensionada para tardar
+      # ~5 (PaginasPorTanda), así que el timeout es red de contención, no el
+      # tiempo esperado.
       Timeout: 900
+      # Las tandas corren en serie (MaxConcurrency 1 en el Map): el ritmo de
+      # requests al sitio queda igual que corriendo el extractor a mano.
       ReservedConcurrentExecutions: 1
       Code:
         S3Bucket:
           Fn::ImportValue: !Sub '${Project}-${Environment}-ArtifactsBucket'
         S3Key: !Sub 'pipeline/${CodeVersion}/scraper-infocasas.zip'
       Environment:
-        Variables: {RAW_BUCKET: !Ref RawBucket, FUENTE: infocasas}
-  CasaswebFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub '${Project}-${Environment}-scraper-casasweb'
-      Runtime: python3.12
-      Handler: app.handler
-      Role: !GetAtt ScraperRole.Arn
-      MemorySize: 512
-      Timeout: 900
-      ReservedConcurrentExecutions: 1
-      Code:
-        S3Bucket:
-          Fn::ImportValue: !Sub '${Project}-${Environment}-ArtifactsBucket'
-        S3Key: !Sub 'pipeline/${CodeVersion}/scraper-casasweb.zip'
-      Environment:
-        Variables: {RAW_BUCKET: !Ref RawBucket, FUENTE: casasweb}
-  BuscandoCasaFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub '${Project}-${Environment}-scraper-buscandocasa'
-      Runtime: python3.12
-      Handler: app.handler
-      Role: !GetAtt ScraperRole.Arn
-      MemorySize: 512
-      Timeout: 900
-      ReservedConcurrentExecutions: 1
-      Code:
-        S3Bucket:
-          Fn::ImportValue: !Sub '${Project}-${Environment}-ArtifactsBucket'
-        S3Key: !Sub 'pipeline/${CodeVersion}/scraper-buscandocasa.zip'
-      Environment:
-        Variables: {RAW_BUCKET: !Ref RawBucket, FUENTE: buscandocasa}
+        Variables:
+          RAW_BUCKET: !Ref RawBucket
+          FUENTE: infocasas
+          # !Sub y no !Ref: las env vars de Lambda son strings.
+          PAGINAS_POR_TANDA: !Sub '${PaginasPorTanda}'
 
   InfoCasasLogs:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub '/aws/lambda/${InfoCasasFunction}'
-      RetentionInDays: 30
-  CasaswebLogs:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub '/aws/lambda/${CasaswebFunction}'
-      RetentionInDays: 30
-  BuscandoCasaLogs:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub '/aws/lambda/${BuscandoCasaFunction}'
       RetentionInDays: 30
 
   # ---------------------------------------------------------------- Glue
@@ -288,7 +267,12 @@ Resources:
         Name: !Sub '${Project}_${Environment}'
         Description: Data lake de avisos de alquiler
 
-  # Tabla de avisos limpios. Esquema inicial de ejemplo, ajustar a lo que produzca Glue.
+  # Tabla de avisos de curated. Las columnas son el contrato de bronze tipado
+  # -- las mismas que escribe glue/transform.py (COLUMNAS) y que produce cada
+  # extractor (write_csv() en etl/extract/scrape_infocasas.py). Si se agrega
+  # una columna al contrato, va en los tres lugares.
+  # `datos_crudos` queda afuera a propósito: el JSON entero del aviso se
+  # guarda en raw, no en la tabla analítica.
   # Partition projection evita registrar particiones a mano o con un crawler.
   AvisosTable:
     Type: AWS::Glue::Table
@@ -316,15 +300,26 @@ Resources:
           SerdeInfo:
             SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
           Columns:
-            - {Name: fuente, Type: string}
-            - {Name: id_aviso, Type: string}
-            - {Name: url, Type: string}
+            - {Name: listing_id, Type: string}
+            - {Name: fuente_datos, Type: string}
             - {Name: barrio, Type: string}
-            - {Name: tipologia, Type: string}
-            - {Name: dormitorios, Type: int}
-            - {Name: metros, Type: double}
+            - {Name: direccion, Type: string}
+            - {Name: operacion, Type: string}
+            - {Name: tipo_propiedad, Type: string}
+            - {Name: estado, Type: string}
+            - {Name: descripcion, Type: string}
+            - {Name: amenities, Type: string}
+            - {Name: fotos, Type: string}
+            # Fechas como string ISO: el tipado fino es trabajo de silver (dbt).
+            - {Name: publicado_en, Type: string}
+            - {Name: ingestado_en, Type: string}
+            - {Name: dormitorios, Type: bigint}
+            - {Name: banos, Type: bigint}
+            - {Name: metraje_m2, Type: bigint}
+            - {Name: foto_count, Type: bigint}
+            - {Name: latitud, Type: double}
+            - {Name: longitud, Type: double}
             - {Name: precio, Type: double}
-            - {Name: moneda, Type: string}
             - {Name: hash_contenido, Type: string}
 
   AthenaWorkGroup:
@@ -356,17 +351,13 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: lambda:InvokeFunction
-                Resource:
-                  - !GetAtt InfoCasasFunction.Arn
-                  - !GetAtt CasaswebFunction.Arn
-                  - !GetAtt BuscandoCasaFunction.Arn
+                Resource: !GetAtt InfoCasasFunction.Arn
               - Effect: Allow
                 Action: [glue:StartJobRun, glue:GetJobRun, glue:GetJobRuns, glue:BatchStopJobRun]
                 Resource: !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${TransformJob}'
-              - Effect: Allow
-                Action: sns:Publish
-                Resource:
-                  Fn::ImportValue: !Sub '${Project}-${Environment}-AlertsTopicArn'
+              # Las fallas no se avisan desde la state machine: las toma
+              # ExecutionFailedRule (abajo) y las publica en el topic de
+              # alertas, con el ARN de la ejecución para ir al detalle.
 
   StateMachine:
     Type: AWS::StepFunctions::StateMachine
@@ -376,13 +367,9 @@ Resources:
       RoleArn: !GetAtt StateMachineRole.Arn
       DefinitionSubstitutions:
         InfoCasasArn: !GetAtt InfoCasasFunction.Arn
-        CasaswebArn: !GetAtt CasaswebFunction.Arn
-        BuscandoCasaArn: !GetAtt BuscandoCasaFunction.Arn
         GlueJobName: !Ref TransformJob
-        AlertsTopicArn:
-          Fn::ImportValue: !Sub '${Project}-${Environment}-AlertsTopicArn'
       Definition:
-        Comment: Corrida semanal, scraping en paralelo y luego transformación con Glue
+        Comment: Corrida semanal, extracción de InfoCasas en tandas y transformación con Glue
         TimeoutSeconds: 7200
         StartAt: PrepararFecha
         States:
@@ -394,100 +381,69 @@ Resources:
             Parameters:
               fecha.$: States.ArrayGetItem(States.StringSplit($.scheduled_time, 'T'), 0)
             Next: Scraping
+          # Una rama por fuente. Hoy solo InfoCasas: sumar una fuente es
+          # agregar su rama acá (ver infra/README.md, "Sumar una fuente").
+          # Si una rama falla, falla la corrida entera y no se transforma
+          # nada a medias.
           Scraping:
             Type: Parallel
             ResultPath: $.scraping
             Next: Transformar
             Branches:
-              - StartAt: InfoCasas
+              - StartAt: PlanificarInfoCasas
                 States:
-                  InfoCasas:
+                  # Cuántas páginas tiene el sitio hoy y en cuántas tandas se
+                  # parte la corrida. Se calcula en cada corrida porque el
+                  # total de avisos cambia semana a semana.
+                  PlanificarInfoCasas:
                     Type: Task
                     Resource: arn:aws:states:::lambda:invoke
                     Parameters:
                       FunctionName: ${InfoCasasArn}
                       Payload:
+                        modo: plan
                         fecha.$: $.fecha
-                    ResultSelector: {fuente: infocasas, estado: ok}
-                    TimeoutSeconds: 960
+                    ResultSelector:
+                      tandas.$: $.Payload.tandas
+                      total_paginas.$: $.Payload.total_paginas
+                    ResultPath: $.plan
+                    TimeoutSeconds: 120
                     Retry:
                       - ErrorEquals: [States.ALL]
-                        IntervalSeconds: 60
+                        IntervalSeconds: 30
                         BackoffRate: 2
                         MaxAttempts: 2
-                    Catch:
-                      - ErrorEquals: [States.ALL]
-                        ResultPath: $.error
-                        Next: AvisarInfoCasas
-                    End: true
-                  AvisarInfoCasas:
-                    Type: Task
-                    Resource: arn:aws:states:::sns:publish
-                    Parameters:
-                      TopicArn: ${AlertsTopicArn}
-                      Subject: Fallo una fuente del pipeline
-                      Message.$: States.Format('Fallo InfoCasas en la corrida del {}. Glue procesa las otras fuentes.', $.fecha)
-                    ResultSelector: {fuente: infocasas, estado: fallida}
-                    End: true
-              - StartAt: Casasweb
-                States:
-                  Casasweb:
-                    Type: Task
-                    Resource: arn:aws:states:::lambda:invoke
-                    Parameters:
-                      FunctionName: ${CasaswebArn}
-                      Payload:
-                        fecha.$: $.fecha
-                    ResultSelector: {fuente: casasweb, estado: ok}
-                    TimeoutSeconds: 960
-                    Retry:
-                      - ErrorEquals: [States.ALL]
-                        IntervalSeconds: 60
-                        BackoffRate: 2
-                        MaxAttempts: 2
-                    Catch:
-                      - ErrorEquals: [States.ALL]
-                        ResultPath: $.error
-                        Next: AvisarCasasweb
-                    End: true
-                  AvisarCasasweb:
-                    Type: Task
-                    Resource: arn:aws:states:::sns:publish
-                    Parameters:
-                      TopicArn: ${AlertsTopicArn}
-                      Subject: Fallo una fuente del pipeline
-                      Message.$: States.Format('Fallo Casasweb en la corrida del {}. Glue procesa las otras fuentes.', $.fecha)
-                    ResultSelector: {fuente: casasweb, estado: fallida}
-                    End: true
-              - StartAt: BuscandoCasa
-                States:
-                  BuscandoCasa:
-                    Type: Task
-                    Resource: arn:aws:states:::lambda:invoke
-                    Parameters:
-                      FunctionName: ${BuscandoCasaArn}
-                      Payload:
-                        fecha.$: $.fecha
-                    ResultSelector: {fuente: buscandocasa, estado: ok}
-                    TimeoutSeconds: 960
-                    Retry:
-                      - ErrorEquals: [States.ALL]
-                        IntervalSeconds: 60
-                        BackoffRate: 2
-                        MaxAttempts: 2
-                    Catch:
-                      - ErrorEquals: [States.ALL]
-                        ResultPath: $.error
-                        Next: AvisarBuscandoCasa
-                    End: true
-                  AvisarBuscandoCasa:
-                    Type: Task
-                    Resource: arn:aws:states:::sns:publish
-                    Parameters:
-                      TopicArn: ${AlertsTopicArn}
-                      Subject: Fallo una fuente del pipeline
-                      Message.$: States.Format('Fallo BuscandoCasa en la corrida del {}. Glue procesa las otras fuentes.', $.fecha)
-                    ResultSelector: {fuente: buscandocasa, estado: fallida}
+                    Next: TandasInfoCasas
+                  # MaxConcurrency 1: las tandas van una después de la otra,
+                  # no en paralelo. El extractor ya espera entre requests
+                  # (DEFAULT_DELAY_SECONDS) y correrlas juntas multiplicaría
+                  # el ritmo contra el sitio.
+                  TandasInfoCasas:
+                    Type: Map
+                    ItemsPath: $.plan.tandas
+                    MaxConcurrency: 1
+                    ResultPath: $.tandas
+                    ItemProcessor:
+                      ProcessorConfig: {Mode: INLINE}
+                      StartAt: ExtraerTanda
+                      States:
+                        ExtraerTanda:
+                          Type: Task
+                          Resource: arn:aws:states:::lambda:invoke
+                          Parameters:
+                            # El plan ya dejó cada tanda con todo lo que la
+                            # invocación necesita (modo, fecha, order,
+                            # start_page, pages).
+                            FunctionName: ${InfoCasasArn}
+                            Payload.$: $
+                          OutputPath: $.Payload
+                          TimeoutSeconds: 960
+                          Retry:
+                            - ErrorEquals: [States.ALL]
+                              IntervalSeconds: 60
+                              BackoffRate: 2
+                              MaxAttempts: 2
+                          End: true
                     End: true
           Transformar:
             Type: Task

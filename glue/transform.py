@@ -1,23 +1,27 @@
 """
 Job de Glue (python shell) del pipeline semanal: raw -> curated -> Postgres.
 Lo despliega infra/pipeline.yaml (TransformJob) y lo invoca la state machine
-después del scraping.
+después de la extracción.
 
 Qué hace:
   1. lee los CSV que dejaron las Lambdas en s3://<raw>/fuente=*/fecha=<fecha>/
-  2. los normaliza al esquema de la tabla `avisos` del catálogo de Glue
+  2. los lleva al contrato de bronze (COLUMNAS, abajo), tipado y dedupeado
   3. escribe un parquet en s3://<curated>/avisos/fecha=<fecha>/
   4. carga esa partición en Postgres (reemplaza la de esa fecha: relanzar la
      corrida no duplica filas)
 
-OJO -- la normalización de acá es deliberadamente mínima (mapeo de columnas,
-dedupe y hash). La limpieza real (barrio canónico, buckets de dormitorios,
-normalización de precio/moneda, tipología) vive hoy en dbt/macros/ y
-dbt/models/staging/. Mientras el warehouse productivo no esté decidido (ver
-docs/business.md §8 y config/connections.yml, entorno prod = TBD) esa lógica
-NO está portada acá: este job deja los datos crudos-pero-tipados en curated y
-en Postgres, y el "precio vs. mercado" se sigue calculando con dbt sobre
-DuckDB.
+Es fuente-agnóstico a propósito: descubre las fuentes por el prefijo
+`fuente=` del bucket raw y lleva cada archivo al mismo contrato de columnas.
+Sumar una fuente nueva no requiere tocar este archivo -- alcanza con que su
+extractor escriba las columnas de COLUMNAS (las que faltan quedan NULL y se
+avisan en el log). Ver infra/README.md, "Sumar una fuente".
+
+OJO -- lo que este job NO hace: la limpieza de silver (barrio canónico,
+buckets de dormitorios, normalización de tipología) vive en dbt/macros/ y
+dbt/models/staging/ y no está portada acá. Curated es bronze tipado, no
+silver. Mientras el warehouse productivo no esté decidido
+(config/connections.yml, entorno prod = TBD) el "precio vs. mercado" se
+sigue calculando con dbt sobre DuckDB.
 
 Dependencias: pandas y pyarrow vienen del library-set analytics; pg8000 viene
 de deps.zip (--extra-py-files), que arma el CI.
@@ -29,37 +33,47 @@ import io
 import json
 import sys
 
-import boto3
 import pandas as pd
 
-# Columnas de la tabla `avisos` del catálogo (ver infra/pipeline.yaml).
-COLUMNAS = [
-    "fuente",
-    "id_aviso",
-    "url",
+# Contrato de bronze: las columnas que escribe cada extractor
+# (write_csv() en etl/extract/scrape_infocasas.py es la referencia) y las que
+# tiene la tabla `avisos` del catálogo de Glue (infra/pipeline.yaml).
+# `datos_crudos` queda deliberadamente afuera de curated: es el JSON entero
+# del aviso, útil para investigar sobre el raw, pesado para una tabla
+# analítica.
+TEXTO = [
+    "listing_id",
+    "fuente_datos",
     "barrio",
-    "tipologia",
-    "dormitorios",
-    "metros",
-    "precio",
-    "moneda",
-    "hash_contenido",
+    "direccion",
+    "operacion",
+    "tipo_propiedad",
+    "estado",
+    "descripcion",
+    "amenities",
+    "fotos",
+    # Fechas como string ISO, igual que en el CSV: el tipado fino es trabajo
+    # de la capa silver (dbt), no de curated.
+    "publicado_en",
+    "ingestado_en",
 ]
+ENTEROS = ["dormitorios", "banos", "metraje_m2", "foto_count"]
+DECIMALES = ["latitud", "longitud", "precio"]
+COLUMNAS = [*TEXTO, *ENTEROS, *DECIMALES, "hash_contenido"]
 
-# Cómo se llama cada columna del catálogo en los CSV de etl/extract/.
-# Varias fuentes traen nombres distintos para el mismo dato.
-ORIGEN = {
-    "id_aviso": ["listing_id"],
-    "url": ["url", "link"],
-    "barrio": ["barrio"],
-    "tipologia": ["tipo_propiedad", "tipologia"],
-    "dormitorios": ["dormitorios"],
-    "metros": ["metraje_m2", "metros", "superficie_m2"],
-    "precio": ["precio"],
-    "moneda": ["moneda"],
-}
+# Identidad de un aviso (para dedupear entre las tandas y entre los dos
+# órdenes con que pagina el extractor de InfoCasas).
+CLAVE = ["fuente_datos", "listing_id"]
+# Lo que define "este aviso cambió" de una semana a la otra.
+CAMPOS_DEL_HASH = ["fuente_datos", "listing_id", "barrio", "dormitorios", "metraje_m2", "precio", "estado"]
 
-s3 = boto3.client("s3")
+def _cliente(servicio: str):
+    # boto3 viene en el runtime de Glue; se importa acá y no arriba para que
+    # los tests del contrato de columnas (tests/unit/test_glue_transform.py)
+    # no necesiten tenerlo instalado.
+    import boto3
+
+    return boto3.client(servicio)
 
 
 def opciones(argv: list[str]) -> argparse.Namespace:
@@ -74,8 +88,10 @@ def opciones(argv: list[str]) -> argparse.Namespace:
 
 
 def leer_raw(raw_bucket: str, fecha: str) -> pd.DataFrame:
-    """Un DataFrame por CSV de la fecha, concatenados. La fuente sale del
-    prefijo fuente=<x>/ de la clave, no del contenido del archivo."""
+    """Todos los CSV de la fecha, de todas las fuentes, concatenados. La
+    fuente sale del prefijo `fuente=<x>/` de la clave; si el archivo además
+    trae la columna fuente_datos (lo esperable), gana la columna."""
+    s3 = _cliente("s3")
     paginador = s3.get_paginator("list_objects_v2")
     partes = []
     for pagina in paginador.paginate(Bucket=raw_bucket):
@@ -86,43 +102,60 @@ def leer_raw(raw_bucket: str, fecha: str) -> pd.DataFrame:
             fuente = clave.split("fuente=", 1)[1].split("/", 1)[0]
             cuerpo = s3.get_object(Bucket=raw_bucket, Key=clave)["Body"].read()
             df = pd.read_csv(io.BytesIO(cuerpo), dtype=str, keep_default_na=False)
-            df["fuente"] = fuente
-            print(f"leído s3://{raw_bucket}/{clave}: {len(df)} filas")
+            if "fuente_datos" not in df.columns:
+                df["fuente_datos"] = fuente
+            print(f"leído s3://{raw_bucket}/{clave}: {len(df)} filas (fuente={fuente})")
             partes.append(df)
 
     if not partes:
         raise RuntimeError(
             f"No hay ningún CSV en s3://{raw_bucket} para fecha={fecha}. "
-            f"Fallaron las tres Lambdas de scraping?"
+            f"¿Falló la extracción?"
         )
     return pd.concat(partes, ignore_index=True)
 
 
 def normalizar(crudo: pd.DataFrame) -> pd.DataFrame:
+    faltantes = [c for c in COLUMNAS if c != "hash_contenido" and c not in crudo.columns]
+    if faltantes:
+        # No es fatal: una fuente puede no tener un campo disponible (ver los
+        # comentarios de stg_listings_casasweb.sql). Pero se avisa, porque si
+        # falta algo que sí debería venir, el síntoma río abajo es una columna
+        # entera en NULL sin ninguna señal.
+        print(f"!! columnas del contrato que no vinieron en el raw: {', '.join(faltantes)}")
+
     salida = pd.DataFrame(index=crudo.index)
-    salida["fuente"] = crudo["fuente"]
+    for columna in TEXTO:
+        valores = crudo[columna] if columna in crudo.columns else None
+        salida[columna] = valores.replace("", None) if valores is not None else None
+    for columna in ENTEROS:
+        valores = crudo[columna] if columna in crudo.columns else None
+        salida[columna] = (
+            pd.to_numeric(valores, errors="coerce").astype("Int64") if valores is not None else pd.NA
+        )
+    for columna in DECIMALES:
+        valores = crudo[columna] if columna in crudo.columns else None
+        # astype("float64") explícito: si en una corrida todos los precios son
+        # enteros, to_numeric devuelve int64 y el parquet sale con esa columna
+        # como INT64, que no coincide con el `double` declarado en el catálogo
+        # de Glue (AvisosTable) y Athena falla al leer la partición.
+        salida[columna] = (
+            pd.to_numeric(valores, errors="coerce").astype("float64")
+            if valores is not None
+            else float("nan")
+        )
 
-    for destino, candidatos in ORIGEN.items():
-        columna = next((c for c in candidatos if c in crudo.columns), None)
-        salida[destino] = crudo[columna] if columna else None
-
-    salida["dormitorios"] = pd.to_numeric(salida["dormitorios"], errors="coerce").astype("Int32")
-    salida["metros"] = pd.to_numeric(salida["metros"], errors="coerce")
-    salida["precio"] = pd.to_numeric(salida["precio"], errors="coerce")
-
-    # El hash permite detectar, semana a semana, si un aviso cambió de precio
-    # o de descripción sin tener que comparar campo por campo.
     def _hash(fila) -> str:
-        crudo_txt = "|".join("" if pd.isna(v) else str(v) for v in fila)
-        return hashlib.sha256(crudo_txt.encode("utf-8")).hexdigest()
+        texto = "|".join("" if pd.isna(v) else str(v) for v in fila)
+        return hashlib.sha256(texto.encode("utf-8")).hexdigest()
 
-    salida["hash_contenido"] = salida[
-        ["fuente", "id_aviso", "barrio", "dormitorios", "metros", "precio", "moneda"]
-    ].apply(_hash, axis=1)
+    salida["hash_contenido"] = salida[CAMPOS_DEL_HASH].apply(_hash, axis=1)
 
     antes = len(salida)
-    salida = salida[salida["id_aviso"].notna() & (salida["id_aviso"] != "")]
-    salida = salida.drop_duplicates(subset=["fuente", "id_aviso"], keep="last")
+    salida = salida[salida["listing_id"].notna()]
+    # keep="last": si dos tandas trajeron el mismo aviso, el último archivo
+    # leído gana (son idénticos salvo que el sitio lo haya editado en el medio).
+    salida = salida.drop_duplicates(subset=CLAVE, keep="last")
     print(f"normalizado: {len(salida)} avisos únicos de {antes} filas crudas")
     return salida[COLUMNAS]
 
@@ -131,7 +164,7 @@ def escribir_curated(df: pd.DataFrame, curated_bucket: str, fecha: str) -> str:
     buffer = io.BytesIO()
     df.to_parquet(buffer, index=False, compression="snappy")
     clave = f"avisos/fecha={fecha}/avisos.parquet"
-    s3.put_object(Bucket=curated_bucket, Key=clave, Body=buffer.getvalue())
+    _cliente("s3").put_object(Bucket=curated_bucket, Key=clave, Body=buffer.getvalue())
     print(f"escrito s3://{curated_bucket}/{clave} ({len(df)} filas)")
     return clave
 
@@ -140,7 +173,7 @@ def cargar_en_postgres(df: pd.DataFrame, db_secret_arn: str, fecha: str) -> None
     import pg8000.dbapi  # de deps.zip
 
     secreto = json.loads(
-        boto3.client("secretsmanager").get_secret_value(SecretId=db_secret_arn)["SecretString"]
+        _cliente("secretsmanager").get_secret_value(SecretId=db_secret_arn)["SecretString"]
     )
     conn = pg8000.dbapi.connect(
         host=secreto["host"],
@@ -155,18 +188,28 @@ def cargar_en_postgres(df: pd.DataFrame, db_secret_arn: str, fecha: str) -> None
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS avisos (
-              fecha          date         NOT NULL,
-              fuente         text         NOT NULL,
-              id_aviso       text         NOT NULL,
-              url            text,
+              fecha          date             NOT NULL,
+              listing_id     text             NOT NULL,
+              fuente_datos   text             NOT NULL,
               barrio         text,
-              tipologia      text,
+              direccion      text,
+              operacion      text,
+              tipo_propiedad text,
+              estado         text,
+              descripcion    text,
+              amenities      text,
+              fotos          text,
+              publicado_en   text,
+              ingestado_en   text,
               dormitorios    integer,
-              metros         double precision,
+              banos          integer,
+              metraje_m2     integer,
+              foto_count     integer,
+              latitud        double precision,
+              longitud       double precision,
               precio         double precision,
-              moneda         text,
               hash_contenido text,
-              PRIMARY KEY (fecha, fuente, id_aviso)
+              PRIMARY KEY (fecha, fuente_datos, listing_id)
             )
             """
         )

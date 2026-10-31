@@ -10,6 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "etl" / "extract"))
 
+import pytest
 import requests
 
 import scrape_infocasas  # noqa: E402
@@ -241,3 +242,98 @@ def test_scrape_merges_two_orders_to_recover_items_a_single_order_would_miss(mon
     rows = scrape("alquiler", "apartamentos", "montevideo", max_pages=None, delay=0)
 
     assert {row["listing_id"] for row in rows} == {"IC1", "IC2", "IC3", "IC4"}
+
+
+def _paginator(**overrides):
+    paginator = {"hasMorePages": True, "total": 7500}
+    paginator.update(overrides)
+    return paginator
+
+
+def test_plan_pages_prefiere_last_page_si_el_sitio_lo_expone(monkeypatch):
+    monkeypatch.setattr(scrape_infocasas, "robots_allows", lambda session, url: True)
+    monkeypatch.setattr(
+        scrape_infocasas,
+        "fetch_page",
+        lambda session, url: {"data": [make_item()] * 21, "paginatorInfo": _paginator(lastPage=359)},
+    )
+    assert scrape_infocasas.plan_pages(None, "alquiler", "apartamentos", "montevideo", ORDER_PRICE_ASC) == 359
+
+
+def test_plan_pages_deduce_las_paginas_del_total_y_el_tamano_de_pagina(monkeypatch):
+    # Sin lastPage: 100 avisos a 21 por página son 5 páginas (la última corta).
+    monkeypatch.setattr(scrape_infocasas, "robots_allows", lambda session, url: True)
+    monkeypatch.setattr(
+        scrape_infocasas,
+        "fetch_page",
+        lambda session, url: {"data": [make_item()] * 21, "paginatorInfo": _paginator(total=100)},
+    )
+    assert scrape_infocasas.plan_pages(None, "alquiler", "apartamentos", "montevideo", ORDER_PRICE_ASC) == 5
+
+
+def test_plan_pages_falla_si_el_paginator_no_alcanza(monkeypatch):
+    # Mejor cortar acá que planificar una corrida de una sola tanda y creer
+    # que se bajó todo.
+    monkeypatch.setattr(scrape_infocasas, "robots_allows", lambda session, url: True)
+    monkeypatch.setattr(
+        scrape_infocasas,
+        "fetch_page",
+        lambda session, url: {"data": [], "paginatorInfo": {"hasMorePages": False}},
+    )
+    with pytest.raises(RuntimeError):
+        scrape_infocasas.plan_pages(None, "alquiler", "apartamentos", "montevideo", ORDER_PRICE_ASC)
+
+
+def test_scrape_de_una_tanda_pide_solo_sus_paginas(monkeypatch):
+    # Lo que corre cada invocación de la Lambda: una tanda de páginas de un
+    # solo orden (ver lambdas/scraper/app.py). Si start_page no se respetara,
+    # cada tanda volvería a bajar la corrida entera desde la página 1.
+    pedidas = []
+
+    def fake_fetch_page(session, url):
+        pedidas.append(url)
+        return {"data": [make_item()], "paginatorInfo": _paginator()}
+
+    monkeypatch.setattr(scrape_infocasas, "robots_allows", lambda session, url: True)
+    monkeypatch.setattr(scrape_infocasas, "fetch_page", fake_fetch_page)
+
+    scrape(
+        "alquiler",
+        "apartamentos",
+        "montevideo",
+        max_pages=3,
+        delay=0,
+        orders=(ORDER_PRICE_ASC,),
+        start_page=5,
+    )
+
+    assert pedidas == [
+        category_url("alquiler", "apartamentos", "montevideo", page, ORDER_PRICE_ASC)
+        for page in (5, 6, 7)
+    ]
+
+
+def test_scrape_de_una_tanda_corta_si_el_sitio_se_queda_sin_paginas(monkeypatch):
+    # El plan se calcula al principio de la corrida; si el sitio achicó el
+    # total en el medio, la tanda tiene que cortar por hasMorePages y no
+    # seguir pidiendo páginas que ya no existen.
+    pedidas = []
+
+    def fake_fetch_page(session, url):
+        pedidas.append(url)
+        return {"data": [make_item()], "paginatorInfo": _paginator(hasMorePages=False)}
+
+    monkeypatch.setattr(scrape_infocasas, "robots_allows", lambda session, url: True)
+    monkeypatch.setattr(scrape_infocasas, "fetch_page", fake_fetch_page)
+
+    scrape(
+        "alquiler",
+        "apartamentos",
+        "montevideo",
+        max_pages=50,
+        delay=0,
+        orders=(ORDER_PRICE_ASC,),
+        start_page=10,
+    )
+
+    assert pedidas == [category_url("alquiler", "apartamentos", "montevideo", 10, ORDER_PRICE_ASC)]

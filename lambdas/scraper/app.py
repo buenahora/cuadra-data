@@ -1,103 +1,170 @@
 """
-Handler de las tres Lambdas de scraping del pipeline semanal
-(infra/pipeline.yaml: scraper-infocasas, scraper-casasweb, scraper-buscandocasa).
+Lambda de extracción de InfoCasas: el paso de scraping del pipeline semanal
+(infra/pipeline.yaml → función `${Project}-${Environment}-scraper-infocasas`).
 
-Las tres comparten este mismo código: la variable de entorno FUENTE, que
-setea CloudFormation, decide qué extractor correr. El CI sube el mismo zip
-con los tres nombres de archivo que espera el template.
+No reimplementa nada: usa etl/extract/scrape_infocasas.py, el mismo extractor
+que se corre a mano en local. Lo único que agrega es lo que cambia en la nube:
+dónde escribe (S3 en vez del disco) y en cuántas tandas se parte la corrida.
 
-No reimplementa nada: llama al `main()` de etl/extract/scrape_*.py, el mismo
-que se corre a mano en local. Lo único que cambia es dónde escribe: en
-Lambda el disco es de solo lectura salvo /tmp, así que se redirige
-DATA_LAYER_ROOT a /tmp antes de importar el extractor (los módulos hacen
-`from cuadra_data.config import DATA_LAYER_ROOT`, o sea que leen el valor
-una sola vez, al importarse) y después se sube lo que quedó en
-/tmp/.../data/raw/ al bucket raw.
+**Dos modos**, los dos invocados por la state machine:
 
-Límite a tener en cuenta: el timeout máximo de Lambda es 15 min y una
-corrida completa de InfoCasas tarda ~18 (ver docstring de
-etl/extract/scrape_infocasas.py). Por eso MAX_PAGES / MAX_ZONAS / COMBOS son
-variables de entorno: hoy hay que acotar la corrida. Si se necesita la
-corrida completa, el extractor tiene que pasar a Fargate o a un job de Glue
-en vez de Lambda -- ver docs/scraping-strategy.md.
+- `{"modo": "plan", "fecha": "2026-10-30"}` pega una sola vez a la primera
+  página de cada orden, lee cuántas páginas hay hoy y devuelve la lista de
+  tandas a correr. El total de avisos del sitio cambia semana a semana, así
+  que el plan se calcula en cada corrida en vez de quedar fijo en el template.
+
+- `{"modo": "extract", "fecha": ..., "order": 1, "start_page": 1, "pages": 150}`
+  corre esa tanda y sube un CSV a
+  `s3://$RAW_BUCKET/fuente=infocasas/fecha=<fecha>/listings-order<order>-p<desde>-<hasta>.csv`.
+
+Por qué en tandas: una corrida completa son ~359 páginas por orden × 2
+órdenes a 1,2 s por request (~18 min) y el timeout máximo de Lambda es 15.
+Las tandas corren **una después de la otra** (el Map de la state machine usa
+MaxConcurrency 1), no en paralelo: así el ritmo de requests al sitio queda
+igual que corriendo el extractor a mano. Ver docs/scraping-strategy.md.
+
+**Contrato que cumple esta fuente** -- lo mismo que tiene que cumplir
+cualquier fuente nueva (ver infra/README.md):
+
+1. Escribe CSVs bajo `fuente=<nombre>/fecha=<YYYY-MM-DD>/` en el bucket raw.
+2. Las columnas son las del contrato de bronze (las de `write_csv()` en
+   etl/extract/scrape_infocasas.py).
+3. La `fecha` se la da la state machine y es la misma para toda la corrida:
+   relanzar la semana pisa los mismos objetos en vez de duplicarlos.
 """
 
+import math
 import os
 import shutil
-import sys
 from pathlib import Path
 
-import boto3
+import requests
 
+import scrape_infocasas as infocasas
+
+FUENTE = os.environ.get("FUENTE", "infocasas")
+# El extractor cubre una sola combinación operación+tipo por corrida.
+OPERACION = os.environ.get("OPERACION", "alquiler")
+TIPO_PROPIEDAD = os.environ.get("TIPO_PROPIEDAD", "apartamentos")
+CIUDAD = os.environ.get("CIUDAD", "montevideo")
+DELAY_SEGUNDOS = float(os.environ.get("DELAY_SEGUNDOS", infocasas.DEFAULT_DELAY_SECONDS))
+# 150 páginas ≈ 4,5 min a 1,2 s por request: holgado contra el timeout de 15
+# min, incluso si el sitio responde más lento que de costumbre.
+PAGINAS_POR_TANDA = int(os.environ.get("PAGINAS_POR_TANDA", "150"))
+
+# Único directorio escribible en Lambda.
 TMP_ROOT = Path("/tmp/cuadra-data")
 
-# Tiene que pasar antes de importar cualquier etl/extract/scrape_*.py.
-import cuadra_data.config as _cfg  # noqa: E402
 
-_cfg.DATA_LAYER_ROOT = TMP_ROOT
+def _s3():
+    # boto3 viene en el runtime de Lambda; se importa acá y no arriba para que
+    # los tests de las funciones puras no necesiten tenerlo instalado.
+    import boto3
 
-s3 = boto3.client("s3")
+    return boto3.client("s3")
 
 
-def _argv_de_fuente(fuente: str) -> tuple[str, list[str]]:
-    """Devuelve (módulo, argv) para la fuente pedida. Los límites salen del
-    entorno porque el timeout de Lambda no da para la corrida completa."""
-    if fuente == "infocasas":
-        argv = ["scrape_infocasas.py"]
-        if os.environ.get("MAX_PAGES"):
-            argv += ["--max-pages", os.environ["MAX_PAGES"]]
-        return "scrape_infocasas", argv
+def _sesion() -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"User-Agent": infocasas.USER_AGENT, "Accept-Language": "es-UY,es;q=0.9"})
+    return session
 
-    if fuente == "casasweb":
-        argv = ["scrape_casasweb.py"]
-        if os.environ.get("MAX_ZONAS"):
-            argv += ["--max-zonas", os.environ["MAX_ZONAS"]]
-        return "scrape_casasweb", argv
 
-    if fuente == "buscandocasa":
-        out = TMP_ROOT / "data" / "raw" / "listings_buscandocasa.csv"
-        argv = ["scrape_buscandocasa.py", "--out", str(out)]
-        if os.environ.get("COMBOS"):
-            argv += ["--combos", *os.environ["COMBOS"].split()]
-        return "scrape_buscandocasa", argv
+def tandas_de(total_paginas: int, paginas_por_tanda: int) -> list[dict]:
+    """Parte [1..total_paginas] en tandas de a lo sumo `paginas_por_tanda`."""
+    if total_paginas < 1:
+        return []
+    if paginas_por_tanda < 1:
+        raise ValueError(f"paginas_por_tanda tiene que ser >= 1, no {paginas_por_tanda}")
+    cantidad = math.ceil(total_paginas / paginas_por_tanda)
+    tandas = []
+    for i in range(cantidad):
+        start_page = i * paginas_por_tanda + 1
+        # La última tanda no se pasa del total: así no se gastan requests en
+        # páginas vacías (el extractor igual cortaría por hasMorePages).
+        tandas.append({"start_page": start_page, "pages": min(paginas_por_tanda, total_paginas - start_page + 1)})
+    return tandas
 
-    raise ValueError(f"FUENTE desconocida: {fuente!r} (infocasas | casasweb | buscandocasa)")
+
+def clave_de_tanda(fuente: str, fecha: str, order: int, start_page: int, pages: int) -> str:
+    """Clave en el bucket raw. Determinística: relanzar la misma corrida
+    sobreescribe el mismo objeto."""
+    return (
+        f"fuente={fuente}/fecha={fecha}/"
+        f"listings-order{order}-p{start_page}-{start_page + pages - 1}.csv"
+    )
+
+
+def _planificar(fecha: str) -> dict:
+    session = _sesion()
+    total_por_orden = {}
+    tandas = []
+    for order in infocasas.STABLE_ORDERS:
+        total = infocasas.plan_pages(session, OPERACION, TIPO_PROPIEDAD, CIUDAD, order)
+        total_por_orden[str(order)] = total
+        for tanda in tandas_de(total, PAGINAS_POR_TANDA):
+            # Cada tanda viaja con todo lo que la invocación necesita, así el
+            # Map de la state machine la pasa tal cual como payload.
+            tandas.append({"modo": "extract", "fecha": fecha, "order": order, **tanda})
+        print(f"order={order}: {total} páginas -> {math.ceil(total / PAGINAS_POR_TANDA)} tanda(s)")
+
+    return {
+        "fuente": FUENTE,
+        "fecha": fecha,
+        "total_paginas": total_por_orden,
+        "paginas_por_tanda": PAGINAS_POR_TANDA,
+        "tandas": tandas,
+    }
+
+
+def _extraer(fecha: str, order: int, start_page: int, pages: int) -> dict:
+    raw_bucket = os.environ["RAW_BUCKET"]
+
+    rows = infocasas.scrape(
+        OPERACION,
+        TIPO_PROPIEDAD,
+        CIUDAD,
+        max_pages=pages,
+        delay=DELAY_SEGUNDOS,
+        orders=(order,),
+        start_page=start_page,
+    )
+
+    clave = clave_de_tanda(FUENTE, fecha, order, start_page, pages)
+    if not rows:
+        # Tanda vacía: pasa si el sitio achicó el total entre el plan y esta
+        # invocación. No es un fallo -- las otras tandas sí traen datos y el
+        # job de Glue dedupea por listing_id.
+        print(f"tanda sin avisos (order={order}, desde la página {start_page}) -- no se sube nada")
+        return {"fuente": FUENTE, "fecha": fecha, "order": order, "start_page": start_page, "avisos": 0}
+
+    infocasas.add_ingestion_metadata(rows, OPERACION, TIPO_PROPIEDAD)
+
+    destino = TMP_ROOT / Path(clave).name
+    shutil.rmtree(TMP_ROOT, ignore_errors=True)
+    infocasas.write_csv(destino, rows)
+
+    _s3().upload_file(str(destino), raw_bucket, clave)
+    print(f"subido s3://{raw_bucket}/{clave} ({len(rows)} avisos, {destino.stat().st_size} bytes)")
+    destino.unlink(missing_ok=True)
+
+    return {
+        "fuente": FUENTE,
+        "fecha": fecha,
+        "order": order,
+        "start_page": start_page,
+        "pages": pages,
+        "avisos": len(rows),
+        "clave": clave,
+    }
 
 
 def handler(event, context):
-    fuente = os.environ["FUENTE"]
-    raw_bucket = os.environ["RAW_BUCKET"]
-    # La fecha la calcula el primer estado de la state machine y es la misma
-    # para toda la corrida: relanzar la semana pisa los mismos objetos en vez
-    # de duplicarlos (ver infra/pipeline.yaml).
+    modo = event.get("modo", "extract")
     fecha = event["fecha"]
 
-    raw_dir = TMP_ROOT / "data" / "raw"
-    shutil.rmtree(TMP_ROOT, ignore_errors=True)
-    raw_dir.mkdir(parents=True, exist_ok=True)
-
-    modulo, argv = _argv_de_fuente(fuente)
-    extractor = __import__(modulo)
-
-    sys.argv = argv
-    try:
-        extractor.main()
-    except SystemExit as e:
-        # Los extractores hacen sys.exit(1) cuando no obtuvieron ni un aviso.
-        # Para la state machine eso es un fallo de la fuente, no un éxito
-        # vacío: avisa por SNS y sigue con las otras.
-        if e.code:
-            raise RuntimeError(f"El extractor de {fuente} no devolvió avisos") from e
-
-    archivos = sorted(p for p in raw_dir.glob("*.csv") if p.is_file())
-    if not archivos:
-        raise RuntimeError(f"El extractor de {fuente} no dejó ningún CSV en {raw_dir}")
-
-    claves = []
-    for archivo in archivos:
-        clave = f"fuente={fuente}/fecha={fecha}/{archivo.name}"
-        s3.upload_file(str(archivo), raw_bucket, clave)
-        claves.append(clave)
-        print(f"subido s3://{raw_bucket}/{clave} ({archivo.stat().st_size} bytes)")
-
-    return {"fuente": fuente, "fecha": fecha, "archivos": claves}
+    if modo == "plan":
+        return _planificar(fecha)
+    if modo == "extract":
+        return _extraer(fecha, int(event["order"]), int(event["start_page"]), int(event["pages"]))
+    raise ValueError(f"modo desconocido: {modo!r} (plan | extract)")
