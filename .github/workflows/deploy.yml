@@ -140,6 +140,7 @@ jobs:
               Project="$PROJECT" \
               Environment="$ENVIRONMENT" \
               CodeVersion="$GITHUB_SHA" \
+              ${{ vars.LAMBDA_RESERVED_CONCURRENCY && format('LambdaReservedConcurrency={0}', vars.LAMBDA_RESERVED_CONCURRENCY) || '' }} \
               ${{ vars.SCHEDULE_EXPRESSION && format('ScheduleExpression={0}', vars.SCHEDULE_EXPRESSION) || '' }} \
               ${{ vars.PAGINAS_POR_TANDA && format('PaginasPorTanda={0}', vars.PAGINAS_POR_TANDA) || '' }}
 

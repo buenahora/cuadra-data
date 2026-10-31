@@ -118,3 +118,24 @@ Variables (todas opcionales): `AWS_REGION`, `PROJECT`, `ENVIRONMENT`,
 
 El runbook completo y la tabla de todos los secrets/variables están en el repo
 del backend: `infra/README.md`.
+
+## Cuenta con plan FREE
+
+El límite total de concurrencia de Lambda en una cuenta con `accountPlanType:
+FREE` es **10** (en una cuenta normal son 1000), y AWS exige dejar 10 **sin
+reservar**. Así que reservar aunque sea 1 falla:
+
+```
+Specified ReservedConcurrentExecutions for function decreases account's
+UnreservedConcurrentExecution below its minimum value of [10]
+```
+
+Variable a cargar en el repo para ese caso:
+
+| Variable | Valor | Por qué |
+| --- | --- | --- |
+| `LAMBDA_RESERVED_CONCURRENCY` | `0` | Saca la reserva del Lambda del scraper |
+
+No cambia el ritmo de scraping: la serialización real la hace `MaxConcurrency: 1`
+en el Map de la state machine, no la reserva. Chequear el plan con
+`aws freetier get-account-plan-state`.

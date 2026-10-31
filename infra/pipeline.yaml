@@ -5,6 +5,16 @@ Description: >
   alertas. Lo despliega el CI del repo del pipeline.
 
 Parameters:
+  # En cuentas con plan FREE el límite total de concurrencia de Lambda es 10, y
+  # AWS exige dejar 10 sin reservar: reservar aunque sea 1 falla con
+  # "decreases account's UnreservedConcurrentExecution below its minimum value
+  # of [10]". Poner 0 saca la reserva. No cambia el ritmo de scraping: la
+  # serialización real la hace MaxConcurrency 1 en el Map de la state machine.
+  LambdaReservedConcurrency:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    Description: Concurrencia reservada del Lambda del scraper. 0 = sin reserva (obligatorio con plan FREE)
   Project:
     Type: String
     Default: alquileres
@@ -27,6 +37,9 @@ Parameters:
       Páginas que baja cada invocación de la Lambda de scraping. A 1,2 s por
       request, 150 páginas son ~5 min: holgado contra el timeout de 15 min de
       Lambda. Bajarlo si el sitio responde más lento.
+
+Conditions:
+  ReservarConcurrencia: !Not [!Equals [!Ref LambdaReservedConcurrency, 0]]
 
 Resources:
   # ---------------------------------------------------------------- Data lake
@@ -143,7 +156,7 @@ Resources:
       Timeout: 900
       # Las tandas corren en serie (MaxConcurrency 1 en el Map): el ritmo de
       # requests al sitio queda igual que corriendo el extractor a mano.
-      ReservedConcurrentExecutions: 1
+      ReservedConcurrentExecutions: !If [ReservarConcurrencia, !Ref LambdaReservedConcurrency, !Ref 'AWS::NoValue']
       Code:
         S3Bucket:
           Fn::ImportValue: !Sub '${Project}-${Environment}-ArtifactsBucket'
