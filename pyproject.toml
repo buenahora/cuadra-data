@@ -16,6 +16,11 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8.0,<9",
+    # Para tests/integration/test_gold_postgres.py: el SQL gold que corre el
+    # job de Glue solo se puede validar contra un Postgres de verdad. En
+    # producción pg8000 llega por deps.zip (glue/requirements-glue.txt), no
+    # por acá.
+    "pg8000>=1.31,<2",
 ]
 # No instalado por defecto -- ver pipelines/dags/market_stats_dag.py para
 # por qué Airflow todavía no está desplegado. `uv sync --group airflow`
