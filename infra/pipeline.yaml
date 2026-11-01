@@ -267,6 +267,12 @@ Resources:
         --curated_bucket: !Ref CuratedBucket
         --db_secret_arn:
           Fn::ImportValue: !Sub '${Project}-${Environment}-AppDbSecretArn'
+        # Bundle de CAs de RDS. Va por S3 porque el job corre en subredes
+        # privadas sin NAT: no puede bajarlo de internet.
+        --rds_ca_s3_uri: !Sub
+          - 's3://${Bucket}/pipeline/${CodeVersion}/rds-ca-bundle.pem'
+          - Bucket:
+              Fn::ImportValue: !Sub '${Project}-${Environment}-ArtifactsBucket'
         --extra-py-files: !Sub
           - 's3://${Bucket}/pipeline/${CodeVersion}/deps.zip'
           - Bucket:

@@ -371,6 +371,7 @@ def opciones(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--raw_bucket", required=True)
     parser.add_argument("--curated_bucket", required=True)
     parser.add_argument("--db_secret_arn", required=True)
+    parser.add_argument("--rds_ca_s3_uri", required=True)
     args, _ignorados = parser.parse_known_args(argv)
     return args
 
@@ -457,7 +458,31 @@ def escribir_curated(df: pd.DataFrame, curated_bucket: str, fecha: str) -> str:
     return clave
 
 
-def cargar_en_postgres(df: pd.DataFrame, db_secret_arn: str, fecha: str) -> None:
+def _contexto_ssl(uri_ca: str):
+    """Contexto TLS que confía en la CA de RDS.
+
+    El certificado de RDS lo firma una CA propia de Amazon que no está en el
+    almacén de confianza del contenedor de Glue, así que ssl_context=True
+    falla con "SSL: CERTIFICATE_VERIFY_FAILED ... self signed certificate in
+    certificate chain". (La AMI de la app sí la trae, por eso el backend
+    conecta sin esto.)
+
+    El bundle llega por S3 y no por descarga directa: el job corre en subredes
+    privadas sin NAT, así que no tiene salida a internet -- solo los VPC
+    endpoints. El CI lo baja y lo sube junto al resto de los artefactos.
+
+    Se verifica de verdad (create_default_context valida cadena y hostname);
+    no se desactiva la verificación.
+    """
+    import ssl
+
+    bucket, _, clave = uri_ca.removeprefix("s3://").partition("/")
+    destino = "/tmp/rds-ca-bundle.pem"
+    _cliente("s3").download_file(bucket, clave, destino)
+    return ssl.create_default_context(cafile=destino)
+
+
+def cargar_en_postgres(df: pd.DataFrame, db_secret_arn: str, fecha: str, uri_ca: str) -> None:
     import pg8000.dbapi  # de deps.zip
 
     secreto = json.loads(
@@ -469,7 +494,7 @@ def cargar_en_postgres(df: pd.DataFrame, db_secret_arn: str, fecha: str) -> None
         database=secreto.get("dbname", "alquileres"),
         user=secreto["username"],
         password=secreto["password"],
-        ssl_context=True,
+        ssl_context=_contexto_ssl(uri_ca),
     )
     try:
         cur = conn.cursor()
@@ -515,7 +540,7 @@ def main() -> None:
     crudo = leer_raw(args.raw_bucket, args.fecha)
     avisos = normalizar(crudo)
     escribir_curated(avisos, args.curated_bucket, args.fecha)
-    cargar_en_postgres(avisos, args.db_secret_arn, args.fecha)
+    cargar_en_postgres(avisos, args.db_secret_arn, args.fecha, args.rds_ca_s3_uri)
 
 
 if __name__ == "__main__":

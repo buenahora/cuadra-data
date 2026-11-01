@@ -125,6 +125,11 @@ jobs:
           aws s3 cp build/scraper-infocasas.zip "$destino/scraper-infocasas.zip"
           aws s3 cp build/deps.zip "$destino/deps.zip"
           aws s3 cp glue/transform.py "$destino/transform.py"
+          # El bundle de CAs de RDS: lo baja el CI (que sí tiene internet) y lo
+          # consume el job de Glue desde S3, porque corre sin salida a internet.
+          curl -fsS https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+            -o rds-ca-bundle.pem
+          aws s3 cp rds-ca-bundle.pem "$destino/rds-ca-bundle.pem"
 
       - name: CloudFormation deploy (pipeline)
         run: |
